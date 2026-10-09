@@ -929,6 +929,13 @@ function koganFacetGroupFor(optionName) {
   return KOGAN_FACET_GROUPS[String(optionName).trim().toLowerCase()] || DEFAULT_KOGAN_FACET_GROUP;
 }
 
+// Kogan's own API example uses the "Internal Storage" facet type inside the
+// "Storage" group, so a plain "Storage" option is sent with that name.
+function koganFacetTypeFor(option, group) {
+  const name = String(option.name).trim();
+  return group === "Storage" && name.toLowerCase() === "storage" ? "Internal Storage" : name;
+}
+
 /**
  * Converts the app's variant group description into Kogan's format. Each
  * Shopify option becomes a Kogan facet: the facet type is the option name and
@@ -937,10 +944,10 @@ function koganFacetGroupFor(optionName) {
 function koganVariantPayload(group) {
   if (!group?.options?.length) return null;
 
-  const varyOn = group.options.map((option) => ({
-    group: (option.group || koganFacetGroupFor(option.name)).slice(0, 255),
-    type: option.name.slice(0, 255),
-  }));
+  const varyOn = group.options.map((option) => {
+    const facetGroup = (option.group || koganFacetGroupFor(option.name)).slice(0, 255);
+    return { group: facetGroup, type: koganFacetTypeFor(option, facetGroup).slice(0, 255) };
+  });
 
   return {
     variant: {
@@ -954,7 +961,7 @@ function koganVariantPayload(group) {
       group.options.reduce((facets, option, index) => {
         const name = varyOn[index].group;
         facets[name] ??= { group: name, items: [] };
-        facets[name].items.push({ type: option.name.slice(0, 255), value: String(option.value).slice(0, 255) });
+        facets[name].items.push({ type: varyOn[index].type, value: String(option.value).slice(0, 255) });
         return facets;
       }, {}),
     ),

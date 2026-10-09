@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "90da2e6c10736ac2c647f1242f1e76ff"
-application_url = "https://entity-luck-speaks-compatible.trycloudflare.com"
+application_url = "https://summer-ids-encyclopedia-blake.trycloudflare.com"
 embedded = true
 name = "kogan market place sync"
 
@@ -50,7 +50,7 @@ api_version = "2026-07"
   topics = [ "fulfillments/create", "orders/cancelled" ]
 
 [auth]
-redirect_urls = [ "https://entity-luck-speaks-compatible.trycloudflare.com/api/auth" ]
+redirect_urls = [ "https://summer-ids-encyclopedia-blake.trycloudflare.com/api/auth" ]
 
 [build]
 automatically_update_urls_on_dev = true
