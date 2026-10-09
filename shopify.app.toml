@@ -1,0 +1,56 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "90da2e6c10736ac2c647f1242f1e76ff"
+application_url = "https://entity-luck-speaks-compatible.trycloudflare.com"
+embedded = true
+name = "kogan market place sync"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "write_products,write_inventory,read_locations,write_files,write_orders,read_fulfillments"
+
+[product.metafields.app.kogan_category]
+type = "single_line_text_field"
+name = "Kogan category"
+description = "Kogan category used when listing this product on Kogan, e.g. kogan:46114 or a Kogan category name. Leave empty to use the default category from the app settings."
+
+  [product.metafields.app.kogan_category.access]
+  admin = "merchant_read_write"
+
+[product.metafields.app.kogan_price]
+type = "number_decimal"
+name = "Kogan price"
+description = "Price for this product on Kogan. Applies to every variant unless a variant has its own Kogan price. Leave empty to use the Shopify price."
+validations.min = "0"
+
+  [product.metafields.app.kogan_price.access]
+  admin = "merchant_read_write"
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products"
+  topics = [ "products/create", "products/update", "products/delete" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/inventory"
+  topics = [ "inventory_levels/update" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders"
+  topics = [ "fulfillments/create", "orders/cancelled" ]
+
+[auth]
+redirect_urls = [ "https://entity-luck-speaks-compatible.trycloudflare.com/api/auth" ]
+
+[build]
+automatically_update_urls_on_dev = true

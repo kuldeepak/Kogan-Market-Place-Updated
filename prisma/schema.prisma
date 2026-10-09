@@ -1,0 +1,143 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model KoganSettings {
+  shop                 String   @id
+  sellerId             String?
+  sellerToken          String?
+  apiBaseUrl           String?
+  syncTag              String   @default("Kogan")
+  currency             String   @default("AUD")
+  defaultCategory      String?
+  handlingDays         Int      @default(2)
+  productLocation      String?
+  autoSyncEnabled      Boolean  @default(true)
+  createOnKogan        Boolean  @default(true)
+  zeroStockOnDelete    Boolean  @default(true)
+  importAsActive       Boolean  @default(true)
+  autoGenerateSkus     Boolean  @default(true)
+  orderSyncEnabled     Boolean  @default(true)
+  orderSyncMinutes     Int      @default(10)
+  lastOrderSyncAt      DateTime?
+  lastOrderSyncError   String?
+  updatedAt            DateTime @updatedAt
+}
+
+model KoganProductLink {
+  id                String    @id @default(cuid())
+  shop              String
+  koganSku          String
+  shopifyProductId  String
+  shopifyVariantId  String?
+  inventoryItemId   String?
+  currency          String
+  handlingDays      Int       @default(2)
+  shipping          String?
+  koganImagesKey    String?
+  koganStoreUrl     String?
+  koganGroupId      String?
+  snapshot          String?
+  syncStatus        String    @default("synced")
+  syncError         String?
+  pendingTaskUrl    String?
+  verifyAfter       DateTime?
+  verifyAttempts    Int       @default(0)
+  lastSyncedAt      DateTime?
+  lastDirection     String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([shop, koganSku])
+  @@index([shop, shopifyProductId])
+  @@index([shop, inventoryItemId])
+  @@index([shop, koganGroupId])
+  @@index([shop, verifyAfter])
+}
+
+model SyncJob {
+  id         String    @id @default(cuid())
+  shop       String
+  type       String
+  status     String    @default("running")
+  total      Int       @default(0)
+  processed  Int       @default(0)
+  created    Int       @default(0)
+  updated    Int       @default(0)
+  failed     Int       @default(0)
+  skipped    Int       @default(0)
+  message    String?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  @@index([shop, startedAt])
+}
+
+model SyncLog {
+  id        String   @id @default(cuid())
+  shop      String
+  direction String
+  action    String
+  status    String
+  sku       String?
+  productId String?
+  title     String?
+  message   String?
+  createdAt DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+model KoganOrder {
+  id             String    @id @default(cuid())
+  shop           String
+  koganOrderId   String
+  orderLabel     String?
+  shopifyOrderId String?
+  shopifyName    String?
+  status         String    @default("imported")
+  currency       String
+  totalPrice     String
+  customerName   String?
+  items          String
+  fulfillmentIds String    @default("[]")
+  orderDate      DateTime
+  error          String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([shop, koganOrderId])
+  @@index([shop, shopifyOrderId])
+  @@index([shop, orderDate])
+}
