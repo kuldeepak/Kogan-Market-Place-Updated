@@ -184,3 +184,116 @@ export async function cancelShopifyOrder(admin, orderId, staffNote) {
     throw new Error(`Shopify could not cancel the order: ${errors.map((error) => error.message).join("; ")}`);
   }
 }
+
+const FULFILLABLE_STATUSES = new Set(["OPEN", "IN_PROGRESS"]);
+
+async function getFulfillableLines(admin, orderId) {
+  const data = await shopifyGraphql(
+    admin,
+    `#graphql
+      query KoganFulfillmentOrders($id: ID!) {
+        order(id: $id) {
+          fulfillmentOrders(first: 20) {
+            nodes {
+              id
+              status
+              lineItems(first: 100) {
+                nodes {
+                  id
+                  remainingQuantity
+                  lineItem {
+                    sku
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `,
+    { id: orderId },
+  );
+
+  return (data.order?.fulfillmentOrders?.nodes || [])
+    .filter((fulfillmentOrder) => FULFILLABLE_STATUSES.has(fulfillmentOrder.status))
+    .map((fulfillmentOrder) => ({
+      id: fulfillmentOrder.id,
+      lines: fulfillmentOrder.lineItems.nodes
+        .filter((line) => line.remainingQuantity > 0)
+        .map((line) => ({ id: line.id, sku: line.lineItem?.sku?.trim() || "", remaining: line.remainingQuantity })),
+    }));
+}
+
+/**
+ * Marks items of a Shopify order as fulfilled with the carrier and tracking
+ * number Kogan reported. `items` is a list of { sku, quantity }. Customers are
+ * not notified, because Kogan already informs its own customers.
+ *
+ * Returns the IDs of the fulfillments that were created.
+ */
+export async function fulfillOrderItems(admin, orderId, items, tracking = {}) {
+  const fulfillmentOrders = await getFulfillableLines(admin, orderId);
+  const byFulfillmentOrder = new Map();
+
+  for (const item of items) {
+    let left = item.quantity;
+    for (const fulfillmentOrder of fulfillmentOrders) {
+      for (const line of fulfillmentOrder.lines) {
+        if (left <= 0) break;
+        if (line.sku !== item.sku || line.remaining <= 0) continue;
+
+        const quantity = Math.min(left, line.remaining);
+        line.remaining -= quantity;
+        left -= quantity;
+
+        const entries = byFulfillmentOrder.get(fulfillmentOrder.id) || [];
+        entries.push({ id: line.id, quantity });
+        byFulfillmentOrder.set(fulfillmentOrder.id, entries);
+      }
+    }
+  }
+
+  if (byFulfillmentOrder.size === 0) {
+    throw new Error("Shopify has nothing left to fulfil for these items.");
+  }
+
+  const trackingInfo = tracking.number
+    ? { number: tracking.number, ...(tracking.company ? { company: tracking.company } : {}) }
+    : null;
+  const fulfillmentIds = [];
+
+  for (const [fulfillmentOrderId, fulfillmentOrderLineItems] of byFulfillmentOrder) {
+    const data = await shopifyGraphql(
+      admin,
+      `#graphql
+        mutation FulfillKoganOrder($fulfillment: FulfillmentInput!, $message: String) {
+          fulfillmentCreate(fulfillment: $fulfillment, message: $message) {
+            fulfillment {
+              id
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `,
+      {
+        message: "Dispatched on Kogan",
+        fulfillment: {
+          notifyCustomer: false,
+          ...(trackingInfo ? { trackingInfo } : {}),
+          lineItemsByFulfillmentOrder: [{ fulfillmentOrderId, fulfillmentOrderLineItems }],
+        },
+      },
+    );
+
+    const errors = data.fulfillmentCreate.userErrors;
+    if (errors.length > 0) {
+      throw new Error(`Shopify could not fulfil the order: ${errors.map((error) => error.message).join("; ")}`);
+    }
+    fulfillmentIds.push(data.fulfillmentCreate.fulfillment.id);
+  }
+
+  return fulfillmentIds;
+}

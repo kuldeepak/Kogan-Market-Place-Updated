@@ -24,6 +24,7 @@ export default function App() {
         <s-link href="/app">Dashboard</s-link>
         <s-link href="/app/import">Import</s-link>
         <s-link href="/app/products">Products</s-link>
+        <s-link href="/app/categories">Categories</s-link>
         <s-link href="/app/orders">Orders</s-link>
         <s-link href="/app/activity">Activity</s-link>
         <s-link href="/app/settings">Settings</s-link>

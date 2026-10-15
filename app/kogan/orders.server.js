@@ -2,9 +2,15 @@ import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import { createKoganClient } from "./kogan-client.server";
 import { findVariantsBySkus } from "./shopify-products.server";
-import { cancelShopifyOrder, createOrderFromKogan, getOrderState } from "./shopify-orders.server";
+import {
+  cancelShopifyOrder,
+  createOrderFromKogan,
+  fulfillOrderItems,
+  getOrderState,
+} from "./shopify-orders.server";
 import { getSettings, hasKoganCredentials, logSync, saveSettings } from "./store.server";
 import { checkPendingKoganTasks, verifyKoganState } from "./sync.server";
+import { ensureCategories } from "./categories.server";
 
 const POLL_TICK_MS = 60 * 1000;
 const CANCELLED_LOOKBACK_DAYS = 14;
@@ -201,18 +207,227 @@ async function applyKoganCancellations(admin, shop, kogan) {
   return cancelled;
 }
 
+// ---------------------------------------------------------------------------
+// Kogan -> Shopify: orders dispatched on Kogan
+// ---------------------------------------------------------------------------
+
+const DISPATCH_LOOKBACK_DAYS = 14;
+
 /**
- * Pulls open Kogan orders into Shopify and applies Kogan-side cancellations.
+ * Kogan returns shipped orders for at most 15 days at a time, so the last
+ * 14 days of Shipped and PartiallyShipped orders are read on every sync.
+ */
+async function fetchDispatchedOrders(kogan) {
+  const end = new Date();
+  const start = new Date(end.getTime() - DISPATCH_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+  const range = { startDateUTC: start.toISOString(), endDateUTC: end.toISOString() };
+
+  const [shipped, partial] = await Promise.all([
+    kogan.getOrders("Shipped", range),
+    kogan.getOrders("PartiallyShipped", range),
+  ]);
+
+  return [...new Map([...shipped, ...partial].map((order) => [String(order.ID), order])).values()];
+}
+
+function latestDispatchDate(order) {
+  const dates = (order.DispatchedItems || [])
+    .map((line) => new Date(line.DispatchDateUtc).getTime())
+    .filter(Number.isFinite);
+  return dates.length > 0 ? new Date(Math.max(...dates)) : null;
+}
+
+/**
+ * Works out which units Kogan has dispatched that Shopify does not know about
+ * yet, grouped by tracking number so each parcel becomes one fulfillment.
+ */
+function newDispatches(items, order) {
+  const groups = new Map();
+
+  for (const item of items) {
+    const lines = (order.DispatchedItems || [])
+      .filter((line) => String(line.ID) === item.id)
+      .sort((a, b) => new Date(a.DispatchDateUtc) - new Date(b.DispatchDateUtc));
+
+    const koganTotal = lines.reduce((sum, line) => sum + (Number(line.Quantity) || 0), 0);
+    let missing = Math.min(koganTotal, item.quantity - item.cancelled) - item.dispatched;
+    let alreadyCounted = item.dispatched;
+
+    for (const line of lines) {
+      if (missing <= 0) break;
+      const available = Number(line.Quantity) || 0;
+      if (alreadyCounted >= available) {
+        alreadyCounted -= available;
+        continue;
+      }
+
+      const quantity = Math.min(available - alreadyCounted, missing);
+      alreadyCounted = 0;
+      missing -= quantity;
+
+      const key = `${line.TrackingNumber || ""}|${line.Carrier || ""}`;
+      const group = groups.get(key) || {
+        tracking: line.TrackingNumber || null,
+        carrier: line.Carrier || null,
+        at: line.DispatchDateUtc || new Date().toISOString(),
+        lines: [],
+      };
+      group.lines.push({ item, quantity });
+      groups.set(key, group);
+    }
+  }
+
+  return [...groups.values()];
+}
+
+function describeTracking(group) {
+  if (group.tracking) return `${group.carrier || "tracking"} ${group.tracking}`;
+  return group.carrier ? `${group.carrier} (no tracking number)` : "no tracking number";
+}
+
+/**
+ * Marks a Shopify order as fulfilled for the units Kogan has dispatched.
+ * The dispatch is written to the app's records before the Shopify
+ * fulfillment is created, so the fulfillments/create webhook that follows
+ * finds nothing left to send and never echoes the dispatch back to Kogan.
+ */
+async function applyDispatchToShopify(admin, shop, row, order) {
+  const items = parseJson(row.items, []);
+  const groups = newDispatches(items, order);
+  if (groups.length === 0) return false;
+
+  const before = row.items;
+  for (const group of groups) {
+    for (const { item, quantity } of group.lines) {
+      item.dispatched += quantity;
+      item.dispatches = [
+        ...(item.dispatches || []),
+        { quantity, carrier: group.carrier, tracking: group.tracking, at: group.at, source: "kogan" },
+      ];
+    }
+  }
+
+  await prisma.koganOrder.update({
+    where: { id: row.id },
+    data: { items: JSON.stringify(items), status: orderStatus(items) },
+  });
+
+  const title = `Kogan order ${row.orderLabel || row.koganOrderId}`;
+  const fulfillmentIds = [];
+
+  try {
+    for (const group of groups) {
+      try {
+        const ids = await fulfillOrderItems(
+          admin,
+          row.shopifyOrderId,
+          group.lines.map(({ item, quantity }) => ({ sku: item.sku, quantity })),
+          { number: group.tracking, company: group.carrier },
+        );
+        fulfillmentIds.push(...ids.map((id) => id.split("/").pop()));
+      } catch (error) {
+        // Fulfilled by hand in Shopify already: nothing to undo.
+        if (!/nothing left to fulfil/i.test(error.message)) throw error;
+      }
+    }
+
+    await prisma.koganOrder.update({
+      where: { id: row.id },
+      data: {
+        fulfillmentIds: JSON.stringify([...parseJson(row.fulfillmentIds, []), ...fulfillmentIds]),
+        error: null,
+      },
+    });
+
+    await logSync(shop, {
+      direction: "kogan_to_shopify",
+      action: "dispatch",
+      status: "success",
+      title,
+      sku: groups.flatMap((group) => group.lines.map(({ item }) => item.sku)).join(", "),
+      message: `Dispatched on Kogan with ${groups.map(describeTracking).join(", ")}, so Shopify order ${row.shopifyName || ""} was marked as fulfilled.`,
+    });
+    return true;
+  } catch (error) {
+    await prisma.koganOrder.update({
+      where: { id: row.id },
+      data: {
+        items: before,
+        status: orderStatus(parseJson(before, [])),
+        error: `Could not mark the Shopify order as fulfilled: ${error.message}`.slice(0, 2000),
+      },
+    });
+    await logSync(shop, {
+      direction: "kogan_to_shopify",
+      action: "dispatch",
+      status: "error",
+      title,
+      message: `Dispatched on Kogan, but Shopify order ${row.shopifyName || ""} could not be marked as fulfilled: ${error.message}`,
+    });
+    return false;
+  }
+}
+
+/**
+ * Brings orders that were dispatched on Kogan into Shopify. Orders Shopify
+ * does not have yet are created and fulfilled; orders that are already in
+ * Shopify are fulfilled with Kogan's tracking details. Orders dispatched
+ * before `dispatchedOrdersFrom` are left alone, so turning the feature on does
+ * not flood Shopify with old orders or take their stock again.
+ */
+async function applyKoganDispatches(admin, shop, settings, kogan, summary) {
+  if (!settings.importDispatchedOrders) return;
+
+  let from = settings.dispatchedOrdersFrom ? new Date(settings.dispatchedOrdersFrom) : null;
+  if (!from) {
+    from = new Date();
+    await saveSettings(shop, { dispatchedOrdersFrom: from });
+  }
+
+  const orders = await fetchDispatchedOrders(kogan);
+  if (orders.length === 0) return;
+
+  const rows = await prisma.koganOrder.findMany({
+    where: { shop, koganOrderId: { in: orders.map((order) => String(order.ID)) } },
+  });
+  const rowsById = new Map(rows.map((row) => [row.koganOrderId, row]));
+
+  for (const order of orders) {
+    let row = rowsById.get(String(order.ID));
+    if (row?.status === "creating" || row?.status === "cancelled") continue;
+
+    if (!row?.shopifyOrderId) {
+      const dispatchedAt = latestDispatchDate(order) || new Date(order.OrderDateUtc);
+      if (dispatchedAt < from) continue;
+
+      const ok = await importKoganOrder(admin, shop, settings, order, row);
+      if (!ok) {
+        summary.failed += 1;
+        continue;
+      }
+      summary.imported += 1;
+      row = await prisma.koganOrder.findFirst({ where: { shop, koganOrderId: String(order.ID) } });
+    }
+
+    if (await applyDispatchToShopify(admin, shop, row, order)) {
+      summary.dispatched += 1;
+    }
+  }
+}
+
+/**
+ * Pulls open Kogan orders into Shopify, applies dispatches made on Kogan and
+ * Kogan-side cancellations.
  * Kogan has no order webhooks, so this runs on a schedule and on demand.
  */
 export async function syncKoganOrders(shop) {
   if (runningSyncs.has(shop)) {
-    return { imported: 0, cancelled: 0, failed: 0, alreadyRunning: true };
+    return { imported: 0, dispatched: 0, cancelled: 0, failed: 0, alreadyRunning: true };
   }
   runningSyncs.add(shop);
 
   const settings = await getSettings(shop);
-  const summary = { imported: 0, cancelled: 0, failed: 0 };
+  const summary = { imported: 0, dispatched: 0, cancelled: 0, failed: 0 };
 
   try {
     const kogan = createKoganClient(settings);
@@ -232,6 +447,7 @@ export async function syncKoganOrders(shop) {
       summary[ok ? "imported" : "failed"] += 1;
     }
 
+    await applyKoganDispatches(admin, shop, settings, kogan, summary);
     summary.cancelled = await applyKoganCancellations(admin, shop, kogan);
 
     await saveSettings(shop, { lastOrderSyncAt: new Date(), lastOrderSyncError: null });
@@ -318,6 +534,10 @@ export async function handleFulfillmentCreated(shop, payload) {
 
     for (const { item, quantity } of lines) {
       item.dispatched += quantity;
+      item.dispatches = [
+        ...(item.dispatches || []),
+        { quantity, carrier: carrier || null, tracking: trackingNumber || null, at: shippedAt, source: "shopify" },
+      ];
     }
 
     await prisma.koganOrder.update({
@@ -440,6 +660,9 @@ async function pollDueShops() {
     );
     await verifyKoganState(shop).catch((error) =>
       console.error(`Kogan verification failed for ${shop}:`, error.message),
+    );
+    await ensureCategories(settings).catch((error) =>
+      console.error(`Kogan category check failed for ${shop}:`, error.message),
     );
 
     if (!settings.orderSyncEnabled) continue;

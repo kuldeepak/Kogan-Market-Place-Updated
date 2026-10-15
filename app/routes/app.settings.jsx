@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { useFetcher, useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import { CategoryPicker } from "../components/category-picker";
 import { authenticate } from "../shopify.server";
 import { DEFAULT_API_BASE_URL, createKoganClient } from "../kogan/kogan-client.server";
+import { categorySourceFor, resolveCategoryValue } from "../kogan/categories.server";
 import {
   SUPPORTED_CURRENCIES,
   getSettings,
@@ -16,6 +18,9 @@ const STOCK_LOCATIONS = ["AU", "NZ", "CN", "HK", "US", "UK"];
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   const settings = await getSettings(session.shop);
+  const defaultCategoryRecord = settings.defaultCategory
+    ? await resolveCategoryValue(categorySourceFor(settings).source, settings.defaultCategory).catch(() => null)
+    : null;
 
   return {
     sellerId: settings.sellerId || "",
@@ -26,6 +31,7 @@ export const loader = async ({ request }) => {
     syncTag: settings.syncTag,
     currency: settings.currency,
     defaultCategory: settings.defaultCategory || "",
+    defaultCategoryPath: defaultCategoryRecord?.display || "",
     handlingDays: settings.handlingDays,
     productLocation: settings.productLocation || "",
     autoSyncEnabled: settings.autoSyncEnabled,
@@ -35,8 +41,19 @@ export const loader = async ({ request }) => {
     autoGenerateSkus: settings.autoGenerateSkus,
     orderSyncEnabled: settings.orderSyncEnabled,
     orderSyncMinutes: settings.orderSyncMinutes,
+    importDispatchedOrders: settings.importDispatchedOrders,
+    dispatchedOrdersFrom: settings.dispatchedOrdersFrom
+      ? new Date(settings.dispatchedOrdersFrom).toISOString().slice(0, 10)
+      : "",
   };
 };
+
+// Returns a Date, null for an empty value, or undefined when the text is not a date.
+function parseDate(value) {
+  if (!value) return null;
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
 
 function readForm(formData, current) {
   const text = (name) => String(formData.get(name) ?? "").trim();
@@ -58,6 +75,8 @@ function readForm(formData, current) {
     autoGenerateSkus: formData.has("autoGenerateSkus"),
     orderSyncEnabled: formData.has("orderSyncEnabled"),
     orderSyncMinutes: Number(text("orderSyncMinutes")),
+    importDispatchedOrders: formData.has("importDispatchedOrders"),
+    dispatchedOrdersFrom: parseDate(text("dispatchedOrdersFrom")),
   };
 }
 
@@ -68,6 +87,11 @@ function validate(values) {
   if (!SUPPORTED_CURRENCIES.includes(values.currency)) errors.currency = "Choose a currency.";
   if (!Number.isInteger(values.handlingDays) || values.handlingDays < 0 || values.handlingDays > 60) {
     errors.handlingDays = "Enter a whole number of days between 0 and 60.";
+  }
+  if (values.dispatchedOrdersFrom === undefined) {
+    errors.dispatchedOrdersFrom = "Enter a valid date.";
+  } else if (values.dispatchedOrdersFrom && values.dispatchedOrdersFrom > new Date()) {
+    errors.dispatchedOrdersFrom = "Choose today or a date in the past.";
   }
   if (!Number.isInteger(values.orderSyncMinutes) || values.orderSyncMinutes < 5 || values.orderSyncMinutes > 1440) {
     errors.orderSyncMinutes = "Enter a whole number of minutes between 5 and 1440.";
@@ -110,71 +134,6 @@ export const action = async ({ request }) => {
   return { intent: "save", ok: true, message: "Settings saved" };
 };
 
-function CategoryPicker({ currency, onSelect }) {
-  const fetcher = useFetcher();
-  const [query, setQuery] = useState("");
-  const timer = useRef();
-
-  useEffect(() => {
-    clearTimeout(timer.current);
-    if (query.trim().length < 2) return undefined;
-    timer.current = setTimeout(() => {
-      fetcher.load(
-        `/api/kogan-categories?q=${encodeURIComponent(query.trim())}&currency=${currency}`,
-      );
-    }, 350);
-    return () => clearTimeout(timer.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, currency]);
-
-  const results = query.trim().length >= 2 ? fetcher.data?.results || [] : [];
-
-  return (
-    <s-stack gap="small">
-      <s-search-field
-        label="Find a Kogan category"
-        placeholder="e.g. headphones, phone cases, 46114"
-        onInput={(event) => setQuery(event.currentTarget.value)}
-      />
-      {fetcher.state === "loading" && (
-        <s-stack direction="inline" gap="small-200" alignItems="center">
-          <s-spinner size="base" accessibilityLabel="Loading categories" />
-          <s-text color="subdued">
-            Searching Kogan categories… the first search can take up to 20 seconds.
-          </s-text>
-        </s-stack>
-      )}
-      {fetcher.data?.error && <s-text tone="critical">{fetcher.data.error}</s-text>}
-      {fetcher.state === "idle" && query.trim().length >= 2 && results.length === 0 && !fetcher.data?.error && fetcher.data && (
-        <s-text color="subdued">No categories match “{query}”.</s-text>
-      )}
-      {results.length > 0 && (
-        <s-box border="base" borderRadius="base" maxBlockSize="320px" overflow="hidden">
-          <s-scroll-box maxBlockSize="320px">
-            {results.map((category, index) => (
-              <s-box
-                key={category.id}
-                padding="small"
-                borderWidth={index === 0 ? undefined : "base none none none"}
-              >
-                <s-stack direction="inline" justifyContent="space-between" alignItems="center" gap="base">
-                  <s-stack gap="small-300">
-                    <s-text type="strong">{category.title}</s-text>
-                    <s-text color="subdued">{category.display} · kogan:{category.id}</s-text>
-                  </s-stack>
-                  <s-button onClick={() => onSelect(`kogan:${category.id}`, category.display)}>
-                    Use
-                  </s-button>
-                </s-stack>
-              </s-box>
-            ))}
-          </s-scroll-box>
-        </s-box>
-      )}
-    </s-stack>
-  );
-}
-
 export default function Settings() {
   const settings = useLoaderData();
   const fetcher = useFetcher();
@@ -182,7 +141,7 @@ export default function Settings() {
   const formRef = useRef(null);
   const [currency, setCurrency] = useState(settings.currency);
   const [category, setCategory] = useState(settings.defaultCategory);
-  const [categoryLabel, setCategoryLabel] = useState("");
+  const [categoryLabel, setCategoryLabel] = useState(settings.defaultCategoryPath);
   const [categoryFieldKey, setCategoryFieldKey] = useState(0);
 
   const errors = fetcher.data?.errors || {};
@@ -392,6 +351,20 @@ export default function Settings() {
                 max={1440}
                 step={1}
                 error={errors.orderSyncMinutes}
+              />
+              <s-switch
+                value="on"
+                name="importDispatchedOrders"
+                label="Bring in orders dispatched on Kogan"
+                details="When an order is dispatched on Kogan, it is created in Shopify if it is not there yet and marked as fulfilled with Kogan's carrier and tracking number."
+                checked={settings.importDispatchedOrders || undefined}
+              />
+              <s-date-field
+                name="dispatchedOrdersFrom"
+                label="Only orders dispatched on or after"
+                value={settings.dispatchedOrdersFrom}
+                details="Older dispatched orders are not created in Shopify, so turning this on does not add past orders or take their stock again. Kogan keeps dispatched orders for the last 14 days. Leave empty to start from today."
+                error={errors.dispatchedOrdersFrom}
               />
             </s-stack>
           </s-section>

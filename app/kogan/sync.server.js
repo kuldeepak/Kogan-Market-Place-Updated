@@ -1,6 +1,7 @@
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import { createKoganClient, storeCodeForCurrency } from "./kogan-client.server";
+import { categorySourceFor, resolveCategoryValue } from "./categories.server";
 import {
   buildSnapshots,
   diffFields,
@@ -137,6 +138,30 @@ async function startJob(shop, type, runner) {
 
 const IMPORT_CONCURRENCY = 3;
 
+function categoryOf(fields) {
+  const value = typeof fields?.category === "string" ? fields.category.trim() : "";
+  return value || null;
+}
+
+/**
+ * Kogan slugs usually end with the category ID, but not always
+ * ("air-tool-parts-accessories"). The stored category tree fills the gap so
+ * imported products are saved with a reliable "kogan:ID" value.
+ */
+async function categoryIdValue(settings, koganProduct, current) {
+  if (/^kogan:[0-9]+$/i.test(current || "")) return current;
+
+  try {
+    const { source } = categorySourceFor(settings);
+    const match =
+      (koganProduct.category_slug && (await resolveCategoryValue(source, koganProduct.category_slug))) ||
+      (koganProduct.category && (await resolveCategoryValue(source, koganProduct.category)));
+    return match ? `kogan:${match.id}` : current;
+  } catch {
+    return current;
+  }
+}
+
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
@@ -212,6 +237,7 @@ async function saveLink(admin, shop, productId, sku, mapped, product) {
     koganStoreUrl: mapped.storeUrl,
     koganGroupId: mapped.variantGroup?.groupId ?? null,
     snapshot: snapshot ? JSON.stringify(snapshot.fields) : null,
+    koganCategory: categoryOf(snapshot?.fields),
     syncStatus: "synced",
     syncError: null,
     lastSyncedAt: new Date(),
@@ -419,6 +445,7 @@ export async function importKoganProducts(
     if (!sku) continue;
 
     const item = { sku, mapped: mapKoganToShopify(koganProduct, settings) };
+    item.mapped.category = await categoryIdValue(settings, koganProduct, item.mapped.category);
     const groupId = item.mapped.variantGroup?.groupId;
 
     if (groupId) {
@@ -889,6 +916,12 @@ async function resolveCategory(kogan, currency, value) {
   const slugId = raw.match(/^[a-z0-9-]+-(\d+)$/i);
   if (slugId) return `kogan:${slugId[1]}`;
 
+  const stored = await resolveCategoryValue(
+    `${new URL(kogan.baseUrl).host}|${storeCodeForCurrency(currency)}`,
+    raw,
+  ).catch(() => null);
+  if (stored) return `kogan:${stored.id}`;
+
   try {
     const categories = await kogan.getAllCategories(storeCodeForCurrency(currency));
     const wanted = slugify(raw);
@@ -1035,8 +1068,10 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
     if (contentChanges.includes("title")) payload.product_title = next.title.slice(0, 255);
     if (contentChanges.includes("description")) payload.product_description = next.description || next.title;
     if (contentChanges.includes("brand") && next.brand) payload.brand = next.brand;
-    if (contentChanges.includes("category") && next.category) {
-      payload.category = await resolveCategory(kogan, link.currency, next.category);
+    if (contentChanges.includes("category")) {
+      // A product without its own category uses the default from Settings.
+      const categoryValue = next.category || (await getSettings(shop)).defaultCategory;
+      if (categoryValue) payload.category = await resolveCategory(kogan, link.currency, categoryValue);
     }
     if (contentChanges.includes("gtin") && next.gtin) payload.product_gtin = next.gtin.slice(0, 14);
     if (contentChanges.includes("weight") && next.weight > 0) {
@@ -1210,6 +1245,7 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
       handlingDays: settings.handlingDays,
       koganGroupId: grouped ? fields.variantGroup.groupId : null,
       snapshot: JSON.stringify(grouped ? fields : { ...fields, variantGroup: null }),
+      koganCategory: categoryOf(fields),
       syncStatus: pendingUrls.length > 0 ? "pending" : "synced",
       pendingTaskUrl: pendingUrls.length > 0 ? JSON.stringify(pendingUrls) : null,
       verifyAfter: nextVerifyTime(),
@@ -1244,6 +1280,7 @@ async function markSynced(shop, link, snapshot, fields, pendingUrls = []) {
       inventoryItemId: snapshot.inventoryItemId,
       koganGroupId: fields.variantGroup?.groupId ?? link.koganGroupId,
       snapshot: JSON.stringify(fields),
+      koganCategory: categoryOf(fields),
       syncStatus: pendingUrls.length > 0 ? "pending" : "synced",
       pendingTaskUrl: pendingUrls.length > 0 ? JSON.stringify(pendingUrls) : null,
       verifyAfter: nextVerifyTime(),

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useFetcher, useLoaderData, useNavigate, useSearchParams } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { useAppBridge } from "@shopify/app-bridge-react";
@@ -6,7 +6,14 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings } from "../kogan/store.server";
 import { pushProductToKogan } from "../kogan/sync.server";
-import { shopifyGraphql } from "../kogan/shopify-products.server";
+import { setProductKoganCategory, shopifyGraphql } from "../kogan/shopify-products.server";
+import {
+  categorySourceFor,
+  presentCategory,
+  resolveCategoryValue,
+  resolveCategoryValues,
+} from "../kogan/categories.server";
+import { CategoryPicker } from "../components/category-picker";
 import {
   ProductStatusBadge,
   SyncStatusBadge,
@@ -35,14 +42,42 @@ export const loader = async ({ request }) => {
     : "all";
   const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
 
+  const settings = await getSettings(shop);
+  const { source } = categorySourceFor(settings);
+  const categoryFilter = (url.searchParams.get("category") || "").trim();
+  let categoryWhere = {};
+  let activeCategory = null;
+
+  if (categoryFilter === "none") {
+    categoryWhere = { koganCategory: null };
+    activeCategory = { title: "No category of their own", display: "Uses the default category" };
+  } else if (/^\d+$/.test(categoryFilter)) {
+    // A category can be stored as "kogan:ID", a name or a slug, so every
+    // stored value that points at this category is matched.
+    const values = (
+      await prisma.koganProductLink.groupBy({
+        by: ["koganCategory"],
+        where: { shop, koganCategory: { not: null } },
+      })
+    ).map((row) => row.koganCategory);
+    const resolved = await resolveCategoryValues(source, values);
+    const matching = values.filter((value) => resolved.get(value)?.id === Number(categoryFilter));
+    categoryWhere = { koganCategory: { in: matching } };
+    const record = await resolveCategoryValue(source, `kogan:${categoryFilter}`);
+    activeCategory = { title: record?.title || `kogan:${categoryFilter}`, display: record?.display || "" };
+  } else if (categoryFilter) {
+    categoryWhere = { koganCategory: categoryFilter };
+    activeCategory = { title: categoryFilter, display: "Not recognised by Kogan" };
+  }
+
   const where = {
     shop,
     ...(status !== "all" ? { syncStatus: status } : {}),
     ...(query ? { koganSku: { contains: query } } : {}),
+    ...categoryWhere,
   };
 
-  const [settings, total, links, counts] = await Promise.all([
-    getSettings(shop),
+  const [total, links, counts] = await Promise.all([
     prisma.koganProductLink.count({ where }),
     prisma.koganProductLink.findMany({
       where,
@@ -101,6 +136,14 @@ export const loader = async ({ request }) => {
     }
   }
 
+  const categoryRecords = await resolveCategoryValues(
+    source,
+    [...links.map((link) => link.koganCategory), settings.defaultCategory].filter(Boolean),
+  );
+  const defaultCategory = settings.defaultCategory
+    ? presentCategory(categoryRecords.get(settings.defaultCategory))
+    : null;
+
   const rows = links.map((link) => {
     const product = products.get(link.shopifyProductId);
     const variant =
@@ -125,6 +168,13 @@ export const loader = async ({ request }) => {
       syncError: link.syncError,
       lastSyncedAt: link.lastSyncedAt,
       koganUrl: link.koganStoreUrl,
+      categoryValue: link.koganCategory,
+      category: link.koganCategory
+        ? presentCategory(categoryRecords.get(link.koganCategory)) || {
+            unknown: true,
+            title: link.koganCategory,
+          }
+        : null,
     };
   });
 
@@ -141,6 +191,9 @@ export const loader = async ({ request }) => {
     status,
     syncTag: settings.syncTag,
     countByStatus,
+    currency: settings.currency,
+    defaultCategory,
+    activeCategory,
   };
 };
 
@@ -151,6 +204,27 @@ export const action = async ({ request }) => {
 
   if (!productId.startsWith("gid://shopify/Product/")) {
     return { ok: false, message: "Unknown product." };
+  }
+
+  if (formData.get("intent") === "set-category") {
+    const value = String(formData.get("value") || "").trim();
+    if (value && !/^kogan:\d+$/.test(value)) {
+      return { ok: false, message: "Choose a category from the list." };
+    }
+
+    try {
+      await setProductKoganCategory(admin, [productId], value || null);
+      const result = await pushProductToKogan(admin, session.shop, productId, { reason: "manual" });
+      if (result.failed > 0) {
+        return { ok: false, message: "Category saved in Shopify, but Kogan rejected it. See the error on the product row." };
+      }
+      return {
+        ok: true,
+        message: value ? "Category saved and sent to Kogan" : "Category removed; the default category will be used",
+      };
+    } catch (error) {
+      return { ok: false, message: error.message };
+    }
   }
 
   try {
@@ -193,9 +267,67 @@ function SyncButton({ productId }) {
   );
 }
 
+function CategoryCell({ category, defaultCategory, onChange }) {
+  return (
+    <s-stack gap="small-300">
+      {category?.unknown ? (
+        <s-stack direction="inline" gap="small-200" alignItems="center">
+          <s-badge tone="critical">Not recognised</s-badge>
+          <s-text>{category.title}</s-text>
+        </s-stack>
+      ) : category ? (
+        <>
+          <s-text type="strong">{category.title}</s-text>
+          <s-text color="subdued">{category.path.slice(0, -1).join(" › ")}</s-text>
+        </>
+      ) : (
+        <>
+          <s-text color="subdued">Default category</s-text>
+          <s-text color="subdued">{defaultCategory ? defaultCategory.title : "No default set"}</s-text>
+        </>
+      )}
+      <s-stack direction="inline">
+        <s-button variant="tertiary" commandFor="category-modal" command="--show" onClick={onChange}>
+          Change
+        </s-button>
+      </s-stack>
+    </s-stack>
+  );
+}
+
 export default function Products() {
-  const { rows, total, page, pageCount, query, status, syncTag, countByStatus } =
-    useLoaderData();
+  const {
+    rows,
+    total,
+    page,
+    pageCount,
+    query,
+    status,
+    syncTag,
+    countByStatus,
+    currency,
+    defaultCategory,
+    activeCategory,
+  } = useLoaderData();
+  const categoryFetcher = useFetcher();
+  const shopify = useAppBridge();
+  const modalRef = useRef(null);
+  const [editing, setEditing] = useState(null);
+
+  useEffect(() => {
+    if (categoryFetcher.state === "idle" && categoryFetcher.data?.message) {
+      shopify.toast.show(categoryFetcher.data.message, { isError: !categoryFetcher.data.ok });
+    }
+  }, [categoryFetcher.state, categoryFetcher.data, shopify]);
+
+  const saveCategory = (value) => {
+    if (!editing) return;
+    categoryFetcher.submit(
+      { intent: "set-category", productId: editing.productId, value },
+      { method: "post" },
+    );
+    modalRef.current?.hideOverlay?.();
+  };
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
 
@@ -253,6 +385,12 @@ export default function Products() {
                   if (value !== query) go({ q: value });
                 }}
               />
+              {activeCategory && (
+                <s-stack direction="inline" gap="small-200" alignItems="center">
+                  <s-badge tone="info">Category: {activeCategory.title}</s-badge>
+                  <s-button variant="tertiary" icon="x" accessibilityLabel="Clear category filter" onClick={() => go({ category: null })} />
+                </s-stack>
+              )}
               <s-stack direction="inline" gap="small-200">
                 {STATUS_FILTERS.map((item) => (
                   <s-button
@@ -269,6 +407,7 @@ export default function Products() {
             <s-table-header-row>
               <s-table-header listSlot="primary">Product</s-table-header>
               <s-table-header>SKU</s-table-header>
+              <s-table-header>Kogan category</s-table-header>
               <s-table-header format="currency">Shopify price</s-table-header>
               <s-table-header format="currency">Kogan price</s-table-header>
               <s-table-header format="numeric">Stock</s-table-header>
@@ -291,6 +430,13 @@ export default function Products() {
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>{row.sku}</s-table-cell>
+                  <s-table-cell>
+                    <CategoryCell
+                      category={row.category}
+                      defaultCategory={defaultCategory}
+                      onChange={() => setEditing(row)}
+                    />
+                  </s-table-cell>
                   <s-table-cell>
                     {row.price ?? "—"}
                   </s-table-cell>
@@ -355,6 +501,44 @@ export default function Products() {
           </s-box>
         </s-section>
       )}
+
+      <s-modal
+        id="category-modal"
+        ref={modalRef}
+        heading={editing ? `Kogan category · ${editing.title}` : "Kogan category"}
+      >
+        <s-stack gap="base">
+          <s-paragraph>
+            Current:{" "}
+            <s-text type="strong">
+              {editing?.category?.unknown
+                ? `${editing.category.title} (not recognised by Kogan)`
+                : editing?.category
+                  ? editing.category.display
+                  : `Default category${defaultCategory ? ` (${defaultCategory.title})` : ""}`}
+            </s-text>
+          </s-paragraph>
+          <s-text color="subdued">
+            The category applies to every variant of this product and is sent to Kogan as soon as
+            you choose it.
+          </s-text>
+          <CategoryPicker
+            key={editing?.id || "none"}
+            currency={currency}
+            actionLabel="Choose"
+            selectedValue={editing?.category?.value || null}
+            onSelect={(value) => saveCategory(value)}
+          />
+        </s-stack>
+        {editing?.categoryValue && (
+          <s-button slot="secondary-actions" onClick={() => saveCategory("")}>
+            Use default category
+          </s-button>
+        )}
+        <s-button slot="secondary-actions" commandFor="category-modal" command="--hide">
+          Cancel
+        </s-button>
+      </s-modal>
     </s-page>
   );
 }

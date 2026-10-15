@@ -16,6 +16,8 @@ const SETTINGS_DEFAULTS = {
   zeroStockOnDelete: true,
   importAsActive: true,
   autoGenerateSkus: true,
+  importDispatchedOrders: true,
+  dispatchedOrdersFrom: null,
 };
 
 export async function getSettings(shop) {

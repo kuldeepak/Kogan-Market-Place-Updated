@@ -63,6 +63,13 @@ export const loader = async ({ request }) => {
         customerName: order.customerName,
         quantity: items.reduce((sum, item) => sum + item.quantity, 0),
         skus: items.map((item) => item.sku).join(", "),
+        parcels: [
+          ...new Map(
+            items
+              .flatMap((item) => item.dispatches || [])
+              .map((dispatch) => [`${dispatch.tracking || ""}|${dispatch.carrier || ""}|${dispatch.source}`, dispatch]),
+          ).values(),
+        ],
         total: `${order.totalPrice} ${order.currency}`,
         shopifyOrderId: order.shopifyOrderId,
         shopifyName: order.shopifyName,
@@ -82,6 +89,7 @@ export const action = async ({ request }) => {
       return { ok: true, message: "Orders are already being fetched" };
     }
     const parts = [`${result.imported} new order${result.imported === 1 ? "" : "s"}`];
+    if (result.dispatched) parts.push(`${result.dispatched} dispatched on Kogan`);
     if (result.cancelled) parts.push(`${result.cancelled} cancelled`);
     if (result.failed) parts.push(`${result.failed} failed`);
     return { ok: result.failed === 0, message: parts.join(" · ") };
@@ -167,6 +175,7 @@ export default function Orders() {
               <s-table-header>Items</s-table-header>
               <s-table-header format="currency">Total</s-table-header>
               <s-table-header>Shopify order</s-table-header>
+              <s-table-header>Tracking</s-table-header>
               <s-table-header listSlot="secondary">Status</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -192,6 +201,25 @@ export default function Orders() {
                       <s-link href={adminOrderUrl(order.shopifyOrderId)}>{order.shopifyName}</s-link>
                     ) : (
                       "—"
+                    )}
+                  </s-table-cell>
+                  <s-table-cell>
+                    {order.parcels.length === 0 ? (
+                      <s-text color="subdued">—</s-text>
+                    ) : (
+                      <s-stack gap="small-300">
+                        {order.parcels.map((parcel, index) => (
+                          <s-stack key={index} gap="small-300">
+                            <s-text>
+                              {parcel.carrier || "Carrier not given"}
+                              {parcel.tracking ? ` · ${parcel.tracking}` : ""}
+                            </s-text>
+                            <s-text color="subdued">
+                              {parcel.source === "kogan" ? "Dispatched on Kogan" : "Fulfilled in Shopify"}
+                            </s-text>
+                          </s-stack>
+                        ))}
+                      </s-stack>
                     )}
                   </s-table-cell>
                   <s-table-cell>
@@ -253,6 +281,11 @@ export default function Orders() {
           <s-list-item>
             Fulfil the order in Shopify with a tracking number. The app tells Kogan it was
             dispatched, with the tracking details.
+          </s-list-item>
+          <s-list-item>
+            If the order is dispatched on Kogan instead, the Shopify order is marked as fulfilled
+            with Kogan’s carrier and tracking number. Dispatched orders that are not in Shopify yet
+            are created there automatically.
           </s-list-item>
           <s-list-item>
             Cancel it in Shopify and it is cancelled on Kogan (Kogan refunds the customer). If the

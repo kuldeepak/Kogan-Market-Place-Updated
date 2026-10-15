@@ -328,6 +328,61 @@ export function createKoganClient(settings = {}) {
 
       return promise;
     },
+
+    /**
+     * Downloads the full category tree of a store with every field Kogan
+     * returns. The whole list is requested in one call first; if Kogan cannot
+     * answer that, it is read page by page (200 categories per page).
+     */
+    async fetchCategoryTree(storeCode = "au", { onProgress } = {}) {
+      const normalise = (category) => ({
+        id: Number(category.id),
+        title: String(category.title || ""),
+        slug: String(category.slug || ""),
+        display: String(category.display || category.title || ""),
+        departments: Array.isArray(category.departments) ? category.departments : [],
+        url: category.url || null,
+        parentId: category.parent_category ? Number(category.parent_category) : null,
+      });
+
+      try {
+        const response = await request("category/", {
+          query: { store_code: storeCode, display_all: true },
+        });
+        const results = response?.body?.results;
+        if (Array.isArray(results) && results.length > 0 && !response?.body?.next) {
+          return results.map(normalise);
+        }
+      } catch (error) {
+        console.warn(`Loading all Kogan categories at once failed, reading page by page: ${error.message}`);
+      }
+
+      const categories = [];
+      let next = null;
+      let first = true;
+
+      while (first || next) {
+        const response = first
+          ? await request("category/", { query: { store_code: storeCode } })
+          : await request(next);
+        first = false;
+        categories.push(...(response?.body?.results || []).map(normalise));
+        next = response?.body?.next || null;
+        onProgress?.(categories.length);
+      }
+
+      return categories;
+    },
+
+    /**
+     * Returns the IDs of the categories the seller already lists products in.
+     */
+    async fetchSupplierCategoryIds(storeCode = "au") {
+      const response = await request("category/", {
+        query: { store_code: storeCode, supplier_only: "True", display_all: true },
+      });
+      return (response?.body?.results || []).map((category) => Number(category.id));
+    },
   };
 }
 

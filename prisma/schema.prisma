@@ -52,6 +52,8 @@ model KoganSettings {
   orderSyncMinutes     Int      @default(10)
   lastOrderSyncAt      DateTime?
   lastOrderSyncError   String?
+  importDispatchedOrders Boolean @default(true)
+  dispatchedOrdersFrom DateTime?
   updatedAt            DateTime @updatedAt
 }
 
@@ -68,6 +70,7 @@ model KoganProductLink {
   koganImagesKey    String?
   koganStoreUrl     String?
   koganGroupId      String?
+  koganCategory     String?
   snapshot          String?
   syncStatus        String    @default("synced")
   syncError         String?
@@ -84,6 +87,7 @@ model KoganProductLink {
   @@index([shop, inventoryItemId])
   @@index([shop, koganGroupId])
   @@index([shop, verifyAfter])
+  @@index([shop, koganCategory])
 }
 
 model SyncJob {
@@ -140,4 +144,29 @@ model KoganOrder {
   @@unique([shop, koganOrderId])
   @@index([shop, shopifyOrderId])
   @@index([shop, orderDate])
+}
+
+model KoganCategory {
+  source      String
+  id          Int
+  title       String
+  slug        String
+  display     String
+  departments String   @default("[]")
+  url         String?
+  parentId    Int?
+  updatedAt   DateTime @updatedAt
+
+  @@id([source, id])
+  @@index([source, slug])
+  @@index([source, title])
+}
+
+model KoganCategorySync {
+  source    String    @id
+  status    String    @default("idle")
+  count     Int       @default(0)
+  syncedAt  DateTime?
+  error     String?
+  updatedAt DateTime  @updatedAt
 }

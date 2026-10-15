@@ -798,6 +798,65 @@ export async function updateShopifyProduct(admin, {
 }
 
 /**
+ * Sets the "Kogan category" metafield of products, or removes it when the
+ * value is empty so the default category from Settings is used.
+ */
+export async function setProductKoganCategory(admin, productIds, value) {
+  const ids = [...new Set(productIds)];
+
+  if (value) {
+    for (let index = 0; index < ids.length; index += 25) {
+      const data = await shopifyGraphql(
+        admin,
+        `#graphql
+          mutation SetKoganCategory($metafields: [MetafieldsSetInput!]!) {
+            metafieldsSet(metafields: $metafields) {
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `,
+        {
+          metafields: ids.slice(index, index + 25).map((ownerId) => ({
+            ownerId,
+            ...KOGAN_CATEGORY_METAFIELD,
+            value,
+          })),
+        },
+      );
+      assertNoUserErrors(data.metafieldsSet, "metafieldsSet");
+    }
+    return;
+  }
+
+  for (let index = 0; index < ids.length; index += 25) {
+    const data = await shopifyGraphql(
+      admin,
+      `#graphql
+        mutation RemoveKoganCategory($metafields: [MetafieldIdentifierInput!]!) {
+          metafieldsDelete(metafields: $metafields) {
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `,
+      {
+        metafields: ids.slice(index, index + 25).map((ownerId) => ({
+          ownerId,
+          namespace: KOGAN_CATEGORY_METAFIELD.namespace,
+          key: KOGAN_CATEGORY_METAFIELD.key,
+        })),
+      },
+    );
+    assertNoUserErrors(data.metafieldsDelete, "metafieldsDelete");
+  }
+}
+
+/**
  * Writes SKUs onto variants. `assignments` is a list of { variantId, sku }.
  */
 export async function assignVariantSkus(admin, productId, assignments) {
