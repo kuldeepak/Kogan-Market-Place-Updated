@@ -77,6 +77,7 @@ model KoganProductLink {
   pendingTaskUrl    String?
   verifyAfter       DateTime?
   verifyAttempts    Int       @default(0)
+  lastTaskId        String?
   lastSyncedAt      DateTime?
   lastDirection     String?
   createdAt         DateTime  @default(now())
@@ -118,6 +119,7 @@ model SyncLog {
   productId String?
   title     String?
   message   String?
+  taskId    String?
   createdAt DateTime @default(now())
 
   @@index([shop, createdAt])

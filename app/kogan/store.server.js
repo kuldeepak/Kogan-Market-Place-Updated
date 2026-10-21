@@ -65,6 +65,7 @@ export async function logSync(shop, entry) {
         productId: entry.productId ?? null,
         title: entry.title ?? null,
         message: entry.message ? String(entry.message).slice(0, 2000) : null,
+        taskId: entry.taskId ? String(entry.taskId).slice(0, 500) : null,
       },
     });
   } catch (error) {

@@ -8,6 +8,14 @@ const CATEGORY_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 
 const categoryCache = new Map();
 
+/**
+ * Kogan identifies every asynchronous write by a task ID, which appears in its
+ * pending URL (".../task/<id>/"). Kogan support asks for this ID.
+ */
+export function taskIdFromUrl(url) {
+  return String(url || "").match(/\/task\/([^/?#]+)/)?.[1] || null;
+}
+
 export class KoganApiError extends Error {
   constructor(message, { status, body } = {}) {
     super(message);
@@ -136,11 +144,13 @@ export function createKoganClient(settings = {}) {
    * per-SKU errors and warnings merged across all batches.
    */
   async function writeInBatches(path, method, items) {
-    const outcome = { status: "Complete", errors: [], warnings: [], error: null, pendingUrls: [] };
+    const outcome = { status: "Complete", errors: [], warnings: [], error: null, pendingUrls: [], taskIds: [] };
 
     for (let index = 0; index < items.length; index += MAX_BATCH_SIZE) {
       const batch = items.slice(index, index + MAX_BATCH_SIZE);
       const initial = await request(path, { method, body: batch });
+      const taskId = taskIdFromUrl(initial?.pending_url);
+      if (taskId) outcome.taskIds.push(taskId);
       const finished = await waitForTask(initial);
 
       if (finished?.status === "AsyncResponsePending") {
@@ -218,6 +228,7 @@ export function createKoganClient(settings = {}) {
         error: response?.error || null,
         errors: response?.body?.errors || [],
         warnings: response?.body?.warnings || [],
+        taskIds: [taskIdFromUrl(pendingUrl)].filter(Boolean),
       };
     },
 

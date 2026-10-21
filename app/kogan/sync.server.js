@@ -1066,11 +1066,13 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
   const warnings = [];
   const pendingUrls = [];
 
+  const taskIds = [];
   const track = (response, { categoryHint = false } = {}) => {
     const found = collectProblems(response);
     problems.push(...(categoryHint ? withCategoryHint(found) : found));
     warnings.push(...collectWarnings(response));
     pendingUrls.push(...(response.pendingUrls || []));
+    taskIds.push(...(response.taskIds || []));
   };
 
   if (contentChanges.length > 0) {
@@ -1139,11 +1141,14 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
   }
 
   if (problems.length > 0) {
-    await recordFailure(shop, link, product, snapshot.sku, "update", problems.join(" | "));
+    if (problems.some(isNotFoundProblem)) {
+      return handleMissingOnKogan(kogan, shop, product, snapshot, link, problems, taskIds);
+    }
+    await recordFailure(shop, link, product, snapshot.sku, "update", problems.join(" | "), taskIds);
     return "failed";
   }
 
-  await markSynced(shop, link, snapshot, next, pendingUrls);
+  await markSynced(shop, link, snapshot, next, pendingUrls, taskIds);
 
   const labels = changed.map((field) => (field === "variantGroup" ? "variants" : field));
   const notes = [];
@@ -1157,10 +1162,71 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
     sku: snapshot.sku,
     productId: product.id,
     title: product.title,
-    message: [`Updated on Kogan: ${labels.join(", ")}`, ...notes].join(". "),
+    message: [
+      `Sent to Kogan: ${labels.join(", ")}. Kogan accepted it; the app confirms the result on Kogan in about 10 minutes`,
+      ...notes,
+    ].join(". "),
+    taskId: taskIds.join(", "),
   });
 
   return "updated";
+}
+
+function isNotFoundProblem(problem) {
+  return /not found|does not exist/i.test(problem) && !/category/i.test(problem);
+}
+
+/**
+ * Kogan answered that the SKU does not exist. The app asks Kogan directly:
+ * when the SKU really is not in this Kogan account (for example it was
+ * created on Kogan's test environment, or never finished being created), it
+ * is listed again. When Kogan does list the SKU but still cannot update it,
+ * the problem is on Kogan's side and the task ID is shown for Kogan support.
+ */
+async function handleMissingOnKogan(kogan, shop, product, snapshot, link, problems, taskIds) {
+  let listed;
+  try {
+    listed = await kogan.getProductBySku(snapshot.sku);
+  } catch (error) {
+    await recordFailure(
+      shop,
+      link,
+      product,
+      snapshot.sku,
+      "update",
+      `${problems.join(" | ")}. The app could not check whether the SKU exists on Kogan: ${error.message}`,
+      taskIds,
+    );
+    return "failed";
+  }
+
+  if (!listed) {
+    // deleteMany: a parallel sync of the same product may have removed it already.
+    await prisma.koganProductLink.deleteMany({ where: { id: link.id } });
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "create",
+      status: "success",
+      sku: snapshot.sku,
+      productId: product.id,
+      title: product.title,
+      message: `Kogan has no product with SKU ${snapshot.sku} in this account, so the app is listing it again.`,
+      taskId: taskIds.join(", "),
+    });
+    const created = await createOnKogan(kogan, shop, await getSettings(shop), product, snapshot);
+    return created ? "created" : "failed";
+  }
+
+  await recordFailure(
+    shop,
+    link,
+    product,
+    snapshot.sku,
+    "update",
+    `Kogan lists SKU ${snapshot.sku}, but its update service cannot find it (${problems.join(" | ")}). This can only be fixed by Kogan: send them the Kogan task ID.`,
+    taskIds,
+  );
+  return "failed";
 }
 
 function collectProblems(response) {
@@ -1218,6 +1284,7 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
   const grouping = koganVariantPayload(fields.variantGroup);
   let response = await kogan.createProducts([grouping ? { ...payload, ...grouping } : payload]);
   let problems = collectProblems(response);
+  const taskIds = [...(response.taskIds || [])];
   let grouped = Boolean(grouping);
 
   // When Kogan refuses only the grouping, the variant is still listed on its
@@ -1226,6 +1293,7 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
     await logVariantRejection(shop, product, snapshot.sku, problems);
     response = await kogan.createProducts([payload]);
     problems = collectProblems(response);
+    taskIds.push(...(response.taskIds || []));
     grouped = false;
   }
 
@@ -1238,6 +1306,7 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
       productId: product.id,
       title: fields.title,
       message: withCategoryHint(problems).join(" | "),
+      taskId: taskIds.join(", "),
     });
     return false;
   }
@@ -1245,27 +1314,35 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
   const pendingUrls = response.pendingUrls || [];
   const warnings = collectWarnings(response);
 
-  await prisma.koganProductLink.create({
-    data: {
-      shop,
-      koganSku: snapshot.sku,
-      shopifyProductId: product.id,
-      shopifyVariantId: snapshot.variantId,
-      inventoryItemId: snapshot.inventoryItemId,
-      currency: settings.currency,
-      handlingDays: settings.handlingDays,
-      koganGroupId: grouped ? fields.variantGroup.groupId : null,
-      snapshot: JSON.stringify(grouped ? fields : { ...fields, variantGroup: null }),
-      koganCategory: categoryOf(fields),
-      syncStatus: pendingUrls.length > 0 ? "pending" : "synced",
-      pendingTaskUrl: pendingUrls.length > 0 ? JSON.stringify(pendingUrls) : null,
-      verifyAfter: nextVerifyTime(),
-      lastSyncedAt: new Date(),
-      lastDirection: "shopify_to_kogan",
-    },
+  const linkData = {
+    shopifyProductId: product.id,
+    shopifyVariantId: snapshot.variantId,
+    inventoryItemId: snapshot.inventoryItemId,
+    currency: settings.currency,
+    handlingDays: settings.handlingDays,
+    koganGroupId: grouped ? fields.variantGroup.groupId : null,
+    snapshot: JSON.stringify(grouped ? fields : { ...fields, variantGroup: null }),
+    koganCategory: categoryOf(fields),
+    syncStatus: "pending",
+    pendingTaskUrl: pendingUrls.length > 0 ? JSON.stringify(pendingUrls) : null,
+    verifyAfter: nextVerifyTime(),
+    lastTaskId: taskIds.at(-1) || null,
+    syncError: null,
+    verifyAttempts: 0,
+    lastSyncedAt: new Date(),
+    lastDirection: "shopify_to_kogan",
+  };
+
+  // upsert: a parallel sync of the same product may have created the link.
+  await prisma.koganProductLink.upsert({
+    where: { shop_koganSku: { shop, koganSku: snapshot.sku } },
+    create: { shop, koganSku: snapshot.sku, ...linkData },
+    update: linkData,
   });
 
-  const base = grouped ? "Created on Kogan as a variant of the product" : "Created on Kogan";
+  const base = grouped
+    ? "Sent to Kogan as a new listing (a variant of the product). The app confirms it on Kogan in about 10 minutes"
+    : "Sent to Kogan as a new listing. The app confirms it on Kogan in about 10 minutes";
   const notes = [];
   if (pendingUrls.length > 0) notes.push("Kogan is still processing the new listing; the result is checked automatically.");
   if (warnings.length > 0) notes.push(`Kogan skipped some data: ${warnings.join(" | ")}`);
@@ -1278,12 +1355,18 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
     productId: product.id,
     title: fields.title,
     message: [base, ...notes].join(". "),
+    taskId: taskIds.join(", "),
   });
 
   return true;
 }
 
-async function markSynced(shop, link, snapshot, fields, pendingUrls = []) {
+/**
+ * Records a write that Kogan accepted. The product stays "pending" (shown as
+ * "Awaiting Kogan") until the app has read it back from Kogan and confirmed
+ * that every value was applied.
+ */
+async function markSynced(shop, link, snapshot, fields, pendingUrls = [], taskIds = []) {
   await prisma.koganProductLink.update({
     where: { id: link.id },
     data: {
@@ -1292,9 +1375,10 @@ async function markSynced(shop, link, snapshot, fields, pendingUrls = []) {
       koganGroupId: fields.variantGroup?.groupId ?? link.koganGroupId,
       snapshot: JSON.stringify(fields),
       koganCategory: categoryOf(fields),
-      syncStatus: pendingUrls.length > 0 ? "pending" : "synced",
+      syncStatus: "pending",
       pendingTaskUrl: pendingUrls.length > 0 ? JSON.stringify(pendingUrls) : null,
       verifyAfter: nextVerifyTime(),
+      lastTaskId: taskIds.at(-1) || link.lastTaskId || null,
       syncError: null,
       lastSyncedAt: new Date(),
       lastDirection: "shopify_to_kogan",
@@ -1327,6 +1411,7 @@ export async function checkPendingKoganTasks(shop) {
     const remaining = [];
     const problems = [];
     const warnings = [];
+    const finishedTaskIds = [];
 
     for (const url of urls) {
       try {
@@ -1337,6 +1422,7 @@ export async function checkPendingKoganTasks(shop) {
         }
         problems.push(...collectProblems(task));
         warnings.push(...collectWarnings(task));
+        if (task.taskIds?.length) finishedTaskIds.push(...task.taskIds);
       } catch (error) {
         if (error.status === 404) continue;
         remaining.push(url);
@@ -1354,6 +1440,7 @@ export async function checkPendingKoganTasks(shop) {
           syncStatus: "error",
           syncError: problems.join(" | ").slice(0, 2000),
           pendingTaskUrl: remaining.length && !giveUp ? JSON.stringify(remaining) : null,
+          lastTaskId: finishedTaskIds.at(-1) || link.lastTaskId,
         },
       });
       await logSync(shop, {
@@ -1364,6 +1451,7 @@ export async function checkPendingKoganTasks(shop) {
         productId: link.shopifyProductId,
         title,
         message: `Kogan finished processing and reported: ${withCategoryHint(problems).join(" | ")}`,
+        taskId: finishedTaskIds.join(", ") || link.lastTaskId,
       });
       continue;
     }
@@ -1381,7 +1469,8 @@ export async function checkPendingKoganTasks(shop) {
     await prisma.koganProductLink.update({
       where: { id: link.id },
       data: {
-        syncStatus: giveUp ? "error" : "synced",
+        // A finished task is still confirmed against Kogan by the verification step.
+        syncStatus: giveUp ? "error" : link.verifyAfter ? "pending" : "synced",
         syncError: giveUp ? "Kogan did not finish processing this update within 24 hours." : null,
         pendingTaskUrl: null,
       },
@@ -1401,11 +1490,18 @@ export async function checkPendingKoganTasks(shop) {
   }
 }
 
-async function recordFailure(shop, link, product, sku, action, message) {
+async function recordFailure(shop, link, product, sku, action, message, taskIds = []) {
+  const taskId = taskIds.filter(Boolean).join(", ") || null;
+
   if (link) {
-    await prisma.koganProductLink.update({
+    // updateMany does not throw when the link was removed in the meantime.
+    await prisma.koganProductLink.updateMany({
       where: { id: link.id },
-      data: { syncStatus: "error", syncError: message.slice(0, 2000) },
+      data: {
+        syncStatus: "error",
+        syncError: message.slice(0, 2000),
+        lastTaskId: taskIds.at(-1) || link.lastTaskId || null,
+      },
     });
   }
 
@@ -1417,6 +1513,7 @@ async function recordFailure(shop, link, product, sku, action, message) {
     productId: product.id,
     title: product.title,
     message,
+    taskId,
   });
 }
 
@@ -1446,6 +1543,7 @@ export function startLocationJob(shop) {
       const batch = links.slice(index, index + LOCATION_BATCH_SIZE);
       const failed = new Map();
       let pendingUrls = [];
+      let taskIds = [];
 
       try {
         const locationResult = await kogan.updateProducts(
@@ -1468,6 +1566,7 @@ export function startLocationJob(shop) {
           if (result.error) for (const link of batch) failed.set(link.koganSku, result.error);
           for (const entry of result.errors) failed.set(entry.product_sku, formatKoganErrors([entry]));
           pendingUrls = pendingUrls.concat(result.pendingUrls || []);
+          taskIds = taskIds.concat(result.taskIds || []);
         }
       } catch (error) {
         for (const link of batch) failed.set(link.koganSku, error.message);
@@ -1486,6 +1585,7 @@ export function startLocationJob(shop) {
             productId: link.shopifyProductId,
             title: link.snapshot ? JSON.parse(link.snapshot).title : null,
             message: `Could not set the stock location to ${location}: ${failed.get(link.koganSku)}`,
+            taskId: taskIds.join(", ") || null,
           });
           continue;
         }
@@ -1496,8 +1596,9 @@ export function startLocationJob(shop) {
           where: { id: link.id },
           data: {
             ...(fields ? { snapshot: JSON.stringify({ ...fields, location }) } : {}),
-            syncStatus: pendingUrls.length ? "pending" : "synced",
+            syncStatus: "pending",
             syncError: null,
+            lastTaskId: taskIds.at(-1) || link.lastTaskId,
             pendingTaskUrl: pendingUrls.length ? JSON.stringify(pendingUrls) : null,
             verifyAfter: nextVerifyTime(),
             verifyAttempts: 0,
@@ -1592,11 +1693,9 @@ function findUnappliedFields(link, sent, koganProduct) {
   const koganPrice = toMoneyString(offer?.price);
   if (sent.price && koganPrice !== sent.price) {
     const gstAdded =
-      link.currency === "NZD" &&
-      koganProduct.product_location !== "NZ" &&
-      koganPrice === toMoneyString(Number(sent.price) * (1 + NZ_GST_RATE));
+      link.currency === "NZD" && koganPrice === toMoneyString(Number(sent.price) * (1 + NZ_GST_RATE));
 
-    if (gstAdded && sent.location !== "NZ") {
+    if (gstAdded && sent.location !== "NZ" && koganProduct.product_location !== "NZ") {
       // Resending the price would not help: Kogan adds GST again every time.
       differences.push({
         fatal: true,
@@ -1606,7 +1705,9 @@ function findUnappliedFields(link, sent, koganProduct) {
       differences.push({
         field: "price",
         text: gstAdded
-          ? `price (Kogan ${koganPrice} includes 15% NZ GST added while the stock location was not NZ, Shopify ${sent.price})`
+          ? koganProduct.product_location === "NZ"
+            ? `price (Kogan ${koganPrice} still includes 15% NZ GST although the stock location on Kogan is NZ, Shopify ${sent.price})`
+            : `price (Kogan ${koganPrice} includes 15% NZ GST added while the stock location was not NZ, Shopify ${sent.price})`
           : `price (Kogan ${offer?.price ?? "none"}, Shopify ${sent.price})`,
       });
     }
@@ -1671,12 +1772,22 @@ export async function verifyKoganState(shop) {
 
     const differences = koganProduct
       ? findUnappliedFields(link, sent, koganProduct)
-      : [{ field: "title", text: "the product is not visible on Kogan yet" }];
+      : [{ field: "title", text: "listing (the product is not visible on Kogan yet)" }];
 
     if (differences.length === 0) {
       await prisma.koganProductLink.update({
         where: { id: link.id },
-        data: { verifyAfter: null, verifyAttempts: 0 },
+        data: { verifyAfter: null, verifyAttempts: 0, syncStatus: "synced", syncError: null },
+      });
+      await logSync(shop, {
+        direction: "shopify_to_kogan",
+        action: "update",
+        status: "success",
+        sku: link.koganSku,
+        productId: link.shopifyProductId,
+        title: sent.title || link.koganSku,
+        message: "Confirmed on Kogan: the product on Kogan matches Shopify.",
+        taskId: link.lastTaskId,
       });
       continue;
     }
@@ -1688,7 +1799,12 @@ export async function verifyKoganState(shop) {
     if (fatal) {
       await prisma.koganProductLink.update({
         where: { id: link.id },
-        data: { verifyAfter: null, verifyAttempts: 0, syncStatus: "error", syncError: `${fatal.text}.` },
+        data: {
+          verifyAfter: null,
+          verifyAttempts: 0,
+          syncStatus: "error",
+          syncError: `${fatal.text}.${link.lastTaskId ? ` Last Kogan task ID: ${link.lastTaskId}.` : ""}`,
+        },
       });
       await logSync(shop, {
         direction: "shopify_to_kogan",
@@ -1698,6 +1814,7 @@ export async function verifyKoganState(shop) {
         productId: link.shopifyProductId,
         title,
         message: `${fatal.text}.`,
+        taskId: link.lastTaskId,
       });
       continue;
     }
@@ -1709,7 +1826,7 @@ export async function verifyKoganState(shop) {
           verifyAfter: null,
           verifyAttempts: 0,
           syncStatus: "error",
-          syncError: `Kogan has not applied these changes after ${MAX_VERIFY_ATTEMPTS} attempts: ${summary}. Use "Sync now" to try again, or contact Kogan support if it continues.`,
+          syncError: `Kogan has not applied these changes after ${MAX_VERIFY_ATTEMPTS} attempts: ${summary}. Use "Sync now" to try again, or send the Kogan task ID to Kogan support if it continues.${link.lastTaskId ? ` Last Kogan task ID: ${link.lastTaskId}.` : ""}`,
         },
       });
       await logSync(shop, {
@@ -1720,6 +1837,7 @@ export async function verifyKoganState(shop) {
         productId: link.shopifyProductId,
         title,
         message: `Kogan has not applied these changes after ${MAX_VERIFY_ATTEMPTS} attempts: ${summary}.`,
+        taskId: link.lastTaskId,
       });
       continue;
     }
@@ -1744,6 +1862,7 @@ export async function verifyKoganState(shop) {
       productId: link.shopifyProductId,
       title,
       message: `Checked Kogan: it had not applied the ${summary}. Sending it again (attempt ${link.verifyAttempts + 1} of ${MAX_VERIFY_ATTEMPTS}).`,
+      taskId: link.lastTaskId,
     });
     resend.add(link.shopifyProductId);
   }

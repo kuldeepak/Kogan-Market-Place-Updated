@@ -166,6 +166,7 @@ export const loader = async ({ request }) => {
       currency: link.currency,
       syncStatus: link.syncStatus,
       syncError: link.syncError,
+      taskId: link.lastTaskId,
       lastSyncedAt: link.lastSyncedAt,
       koganUrl: link.koganStoreUrl,
       categoryValue: link.koganCategory,
@@ -345,7 +346,7 @@ export default function Products() {
   const filterLabel = {
     all: `All (${allCount})`,
     synced: `Synced (${countByStatus.synced || 0})`,
-    pending: `Pending (${countByStatus.pending || 0})`,
+    pending: `Awaiting Kogan (${countByStatus.pending || 0})`,
     error: `Errors (${countByStatus.error || 0})`,
   };
 
@@ -451,7 +452,13 @@ export default function Products() {
                     <s-stack gap="small-300">
                       <SyncStatusBadge status={row.syncStatus} />
                       {row.syncError && (
-                        <s-text tone="critical">{row.syncError.slice(0, 160)}</s-text>
+                        <s-text tone="critical">{row.syncError.split(" Last Kogan task ID:")[0].slice(0, 220)}</s-text>
+                      )}
+                      {row.syncStatus === "pending" && (
+                        <s-text color="subdued">Sent; the app confirms it on Kogan in about 10 minutes.</s-text>
+                      )}
+                      {row.taskId && (row.syncStatus === "error" || row.syncStatus === "pending") && (
+                        <s-text color="subdued">Kogan task ID: {row.taskId}</s-text>
                       )}
                     </s-stack>
                   </s-table-cell>

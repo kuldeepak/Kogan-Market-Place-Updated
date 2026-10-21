@@ -4,7 +4,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 
 const SYNC_STATUS = {
   synced: { tone: "success", label: "Synced" },
-  pending: { tone: "info", label: "Pending" },
+  pending: { tone: "info", label: "Awaiting Kogan" },
   error: { tone: "critical", label: "Error" },
 };
 

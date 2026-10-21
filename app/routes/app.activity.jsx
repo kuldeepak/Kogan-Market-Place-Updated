@@ -163,9 +163,12 @@ export default function Activity() {
                   <LogStatusBadge status={log.status} />
                 </s-table-cell>
                 <s-table-cell>
-                  <s-text tone={log.status === "error" ? "critical" : undefined}>
-                    {log.message || "—"}
-                  </s-text>
+                  <s-stack gap="small-300">
+                    <s-text tone={log.status === "error" ? "critical" : undefined}>
+                      {log.message || "—"}
+                    </s-text>
+                    {log.taskId && <s-text color="subdued">Kogan task ID: {log.taskId}</s-text>}
+                  </s-stack>
                 </s-table-cell>
                 <s-table-cell>{formatDateTime(log.createdAt)}</s-table-cell>
                 <s-table-cell>
