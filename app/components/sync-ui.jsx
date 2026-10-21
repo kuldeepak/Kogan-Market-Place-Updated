@@ -129,7 +129,11 @@ export function JobBanner({ job }) {
   if (!job) return null;
 
   const isImport = job.type === "import";
-  const label = isImport ? "Import from Kogan" : "Push to Kogan";
+  const label = isImport
+    ? "Import from Kogan"
+    : job.type === "location"
+      ? "Stock location update"
+      : "Push to Kogan";
 
   if (job.status === "running") {
     // Kogan does not report a catalogue size, so imports show an open-ended

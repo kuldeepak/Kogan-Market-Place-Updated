@@ -42,6 +42,7 @@ export const loader = async ({ request }) => {
     autoSyncEnabled: settings.autoSyncEnabled,
     stats: { linked, errors, openOrders, lastSyncedAt: lastSync?.lastSyncedAt ?? null },
     lastOrderSyncError: settings.lastOrderSyncError,
+    gstLocationWarning: settings.currency === "NZD" && settings.productLocation !== "NZ",
     latestJob,
     recentLogs,
   };
@@ -104,8 +105,16 @@ function StatCard({ label, value, detail }) {
 }
 
 export default function Dashboard() {
-  const { configured, syncTag, autoSyncEnabled, stats, latestJob, recentLogs, lastOrderSyncError } =
-    useLoaderData();
+  const {
+    configured,
+    syncTag,
+    autoSyncEnabled,
+    stats,
+    latestJob,
+    recentLogs,
+    lastOrderSyncError,
+    gstLocationWarning,
+  } = useLoaderData();
   const jobFetcher = useFetcher();
   const statusFetcher = useFetcher();
   const shopify = useAppBridge();
@@ -157,6 +166,13 @@ export default function Dashboard() {
       <s-stack gap="base">
         <ConnectionBanner status={statusFetcher.data} configured={configured} />
         <JobBanner job={latestJob} />
+        {gstLocationWarning && (
+          <s-banner tone="warning" heading="Set your stock location to New Zealand">
+            Kogan New Zealand adds 15% GST to the price of products whose stock location is not NZ.
+            If your stock ships from New Zealand, choose “NZ – New Zealand” as the stock location.{" "}
+            <s-link href="/app/settings">Open settings</s-link>
+          </s-banner>
+        )}
 
         <s-section heading="Overview">
           <s-grid gridTemplateColumns="repeat(auto-fit, minmax(160px, 1fr))" gap="base">

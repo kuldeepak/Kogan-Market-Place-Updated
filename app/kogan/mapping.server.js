@@ -144,6 +144,7 @@ export function mapKoganToShopify(koganProduct, settings) {
     handlingDays: Number(offer.handling_days) || settings.handlingDays,
     shipping: offer.shipping ?? null,
     storeUrl: koganProduct.store_urls?.[0]?.url || null,
+    location: koganProduct.product_location || null,
   };
 }
 

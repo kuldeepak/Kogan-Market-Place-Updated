@@ -43,6 +43,7 @@ const CONTENT_FIELDS = [
   "productType",
   "images",
   "variantGroup",
+  "location",
 ];
 const OFFER_FIELDS = ["price", "rrp", "stock", "enabled"];
 
@@ -225,6 +226,7 @@ async function saveLink(admin, shop, productId, sku, mapped, product) {
     ),
   });
   const snapshot = snapshots.find((item) => item.sku === sku);
+  if (snapshot && mapped.location !== undefined) snapshot.fields.location = mapped.location;
 
   const linkData = {
     shopifyProductId: productId,
@@ -814,6 +816,12 @@ export async function pushProductToKogan(admin, shop, productId, { reason = "web
 
   await attachVariantGroups(shop, product, snapshots);
 
+  // The stock location is managed from Settings. Kogan uses it for tax: for
+  // Kogan New Zealand, stock that is not located in NZ gets 15% GST added.
+  if (settings.productLocation) {
+    for (const snapshot of snapshots) snapshot.fields.location = settings.productLocation;
+  }
+
   const links = await prisma.koganProductLink.findMany({
     where: { shop, koganSku: { in: snapshots.map((item) => item.sku) } },
   });
@@ -1028,8 +1036,10 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
 
   // Products that were linked before variant groups existed still need their
   // group sent once.
-  if (previous && !("variantGroup" in previous) && next.variantGroup && !changed.includes("variantGroup")) {
-    changed.push("variantGroup");
+  for (const field of ["variantGroup", "location"]) {
+    if (previous && !(field in previous) && next[field] && !changed.includes(field)) {
+      changed.push(field);
+    }
   }
 
   let imageUrls = null;
@@ -1078,6 +1088,7 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
       payload.product_dimensions = { weight: next.weight };
     }
     if (contentChanges.includes("productType")) payload.product_type = next.productType;
+    if (contentChanges.includes("location") && next.location) payload.product_location = next.location;
     if (contentChanges.includes("images") && imageUrls?.length) payload.images = imageUrls;
 
     const grouping = contentChanges.includes("variantGroup") ? koganVariantPayload(next.variantGroup) : null;
@@ -1409,6 +1420,105 @@ async function recordFailure(shop, link, product, sku, action, message) {
   });
 }
 
+const LOCATION_BATCH_SIZE = 100;
+
+/**
+ * Sends the stock location from Settings to Kogan for every linked SKU, in
+ * batches, followed by each SKU's current price. Kogan stores prices with GST
+ * already added for stock that was not located in New Zealand, so the price
+ * is sent again once the location is correct.
+ */
+export function startLocationJob(shop) {
+  return startJob(shop, "location", async (counters, progress) => {
+    const settings = await getSettings(shop);
+    const location = settings.productLocation;
+    if (!location) return "No stock location is set in Settings.";
+
+    const kogan = createKoganClient(settings);
+    const links = await prisma.koganProductLink.findMany({
+      where: { shop },
+      orderBy: { koganSku: "asc" },
+    });
+    counters.total = links.length;
+    await progress(true);
+
+    for (let index = 0; index < links.length; index += LOCATION_BATCH_SIZE) {
+      const batch = links.slice(index, index + LOCATION_BATCH_SIZE);
+      const failed = new Map();
+      let pendingUrls = [];
+
+      try {
+        const locationResult = await kogan.updateProducts(
+          batch.map((link) => ({ product_sku: link.koganSku, product_location: location })),
+        );
+
+        const priced = batch
+          .map((link) => ({ link, fields: link.snapshot ? JSON.parse(link.snapshot) : null }))
+          .filter(({ fields }) => typeof fields?.price === "string" && Number(fields.price) > 0);
+        const priceResult = priced.length
+          ? await kogan.updateStockAndPrice(
+              priced.map(({ link, fields }) => ({
+                product_sku: link.koganSku,
+                offer_data: buildOfferData(link, fields),
+              })),
+            )
+          : { errors: [], pendingUrls: [], error: null };
+
+        for (const result of [locationResult, priceResult]) {
+          if (result.error) for (const link of batch) failed.set(link.koganSku, result.error);
+          for (const entry of result.errors) failed.set(entry.product_sku, formatKoganErrors([entry]));
+          pendingUrls = pendingUrls.concat(result.pendingUrls || []);
+        }
+      } catch (error) {
+        for (const link of batch) failed.set(link.koganSku, error.message);
+      }
+
+      for (const link of batch) {
+        counters.processed += 1;
+
+        if (failed.has(link.koganSku)) {
+          counters.failed += 1;
+          await logSync(shop, {
+            direction: "shopify_to_kogan",
+            action: "update",
+            status: "error",
+            sku: link.koganSku,
+            productId: link.shopifyProductId,
+            title: link.snapshot ? JSON.parse(link.snapshot).title : null,
+            message: `Could not set the stock location to ${location}: ${failed.get(link.koganSku)}`,
+          });
+          continue;
+        }
+
+        counters.updated += 1;
+        const fields = link.snapshot ? JSON.parse(link.snapshot) : null;
+        await prisma.koganProductLink.update({
+          where: { id: link.id },
+          data: {
+            ...(fields ? { snapshot: JSON.stringify({ ...fields, location }) } : {}),
+            syncStatus: pendingUrls.length ? "pending" : "synced",
+            syncError: null,
+            pendingTaskUrl: pendingUrls.length ? JSON.stringify(pendingUrls) : null,
+            verifyAfter: nextVerifyTime(),
+            verifyAttempts: 0,
+          },
+        });
+      }
+
+      await progress(true);
+    }
+
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "update",
+      status: counters.failed > 0 ? "error" : "success",
+      message: `Stock location ${location} sent to Kogan for ${counters.updated} of ${counters.total} SKUs${counters.failed ? ` (${counters.failed} failed)` : ""}. Prices were sent again so Kogan no longer adds GST to them.`,
+    });
+
+    return `Stock location ${location} sent to Kogan for ${counters.updated} of ${counters.total} SKUs.`;
+  });
+}
+
 export function startPushAllJob(shop) {
   return startJob(shop, "push", async (counters, progress) => {
     const { admin } = await unauthenticated.admin(shop);
@@ -1456,6 +1566,7 @@ export function startPushAllJob(shop) {
 // ---------------------------------------------------------------------------
 
 const VERIFY_DELAY_MS = 10 * 60 * 1000;
+const NZ_GST_RATE = 0.15;
 const MAX_VERIFY_ATTEMPTS = 3;
 const VERIFY_BATCH_SIZE = 20;
 
@@ -1470,9 +1581,35 @@ export function nextVerifyTime() {
 function findUnappliedFields(link, sent, koganProduct) {
   const differences = [];
 
+  if (sent.location && koganProduct.product_location !== sent.location) {
+    differences.push({
+      field: "location",
+      text: `stock location (Kogan ${koganProduct.product_location || "not set"}, Settings ${sent.location})`,
+    });
+  }
+
   const offer = koganProduct.offer_data?.[link.currency];
-  if (sent.price && toMoneyString(offer?.price) !== sent.price) {
-    differences.push({ field: "price", text: `price (Kogan ${offer?.price ?? "none"}, Shopify ${sent.price})` });
+  const koganPrice = toMoneyString(offer?.price);
+  if (sent.price && koganPrice !== sent.price) {
+    const gstAdded =
+      link.currency === "NZD" &&
+      koganProduct.product_location !== "NZ" &&
+      koganPrice === toMoneyString(Number(sent.price) * (1 + NZ_GST_RATE));
+
+    if (gstAdded && sent.location !== "NZ") {
+      // Resending the price would not help: Kogan adds GST again every time.
+      differences.push({
+        fatal: true,
+        text: `Kogan added 15% NZ GST to the price (Kogan ${koganPrice}, Shopify ${sent.price}) because the stock location is not NZ. Set "Stock location" to NZ in Settings`,
+      });
+    } else {
+      differences.push({
+        field: "price",
+        text: gstAdded
+          ? `price (Kogan ${koganPrice} includes 15% NZ GST added while the stock location was not NZ, Shopify ${sent.price})`
+          : `price (Kogan ${offer?.price ?? "none"}, Shopify ${sent.price})`,
+      });
+    }
   }
 
   if (sent.stock !== null && sent.stock !== undefined) {
@@ -1546,6 +1683,24 @@ export async function verifyKoganState(shop) {
 
     const summary = differences.map((item) => item.text).join(", ");
     const title = sent.title || link.koganSku;
+
+    const fatal = differences.find((item) => item.fatal);
+    if (fatal) {
+      await prisma.koganProductLink.update({
+        where: { id: link.id },
+        data: { verifyAfter: null, verifyAttempts: 0, syncStatus: "error", syncError: `${fatal.text}.` },
+      });
+      await logSync(shop, {
+        direction: "shopify_to_kogan",
+        action: "update",
+        status: "error",
+        sku: link.koganSku,
+        productId: link.shopifyProductId,
+        title,
+        message: `${fatal.text}.`,
+      });
+      continue;
+    }
 
     if (link.verifyAttempts >= MAX_VERIFY_ATTEMPTS) {
       await prisma.koganProductLink.update({

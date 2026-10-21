@@ -6,6 +6,7 @@ import { CategoryPicker } from "../components/category-picker";
 import { authenticate } from "../shopify.server";
 import { DEFAULT_API_BASE_URL, createKoganClient } from "../kogan/kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "../kogan/categories.server";
+import { startLocationJob } from "../kogan/sync.server";
 import {
   SUPPORTED_CURRENCIES,
   getSettings,
@@ -14,6 +15,14 @@ import {
 } from "../kogan/store.server";
 
 const STOCK_LOCATIONS = ["AU", "NZ", "CN", "HK", "US", "UK"];
+const STOCK_LOCATION_NAMES = {
+  AU: "Australia",
+  NZ: "New Zealand",
+  CN: "China",
+  HK: "Hong Kong",
+  US: "United States",
+  UK: "United Kingdom",
+};
 
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
@@ -125,12 +134,35 @@ export const action = async ({ request }) => {
     }
   }
 
+  if (formData.get("intent") === "apply-location") {
+    if (!current.productLocation) {
+      return { intent: "apply-location", ok: false, message: "Choose and save a stock location first" };
+    }
+    await startLocationJob(session.shop);
+    return {
+      intent: "apply-location",
+      ok: true,
+      message: `Sending stock location ${current.productLocation} to Kogan for all products`,
+    };
+  }
+
   const errors = validate(values);
   if (Object.keys(errors).length > 0) {
     return { intent: "save", ok: false, errors, message: "Please fix the highlighted fields" };
   }
 
   await saveSettings(session.shop, values);
+
+  // A new stock location is applied to every product already on Kogan.
+  if (values.productLocation && values.productLocation !== current.productLocation) {
+    await startLocationJob(session.shop);
+    return {
+      intent: "save",
+      ok: true,
+      message: `Settings saved. Sending stock location ${values.productLocation} to Kogan for all products`,
+    };
+  }
+
   return { intent: "save", ok: true, message: "Settings saved" };
 };
 
@@ -140,6 +172,7 @@ export default function Settings() {
   const shopify = useAppBridge();
   const formRef = useRef(null);
   const [currency, setCurrency] = useState(settings.currency);
+  const [location, setLocation] = useState(settings.productLocation);
   const [category, setCategory] = useState(settings.defaultCategory);
   const [categoryLabel, setCategoryLabel] = useState(settings.defaultCategoryPath);
   const [categoryFieldKey, setCategoryFieldKey] = useState(0);
@@ -251,16 +284,39 @@ export default function Settings() {
                 details="Days it takes you to dispatch an order. Used for products created on Kogan from Shopify."
                 error={errors.handlingDays}
               />
-              <s-select name="productLocation" label="Stock location">
+              <s-select
+                name="productLocation"
+                label="Stock location"
+                details="The country your stock ships from. It is sent to Kogan for every product and kept up to date."
+                onChange={(event) => setLocation(event.currentTarget.value)}
+                onInput={(event) => setLocation(event.currentTarget.value)}
+              >
                 <s-option value="" selected={!settings.productLocation || undefined}>
                   Not specified
                 </s-option>
                 {STOCK_LOCATIONS.map((code) => (
                   <s-option key={code} value={code} selected={settings.productLocation === code || undefined}>
-                    {code}
+                    {STOCK_LOCATION_NAMES[code] ? `${code} – ${STOCK_LOCATION_NAMES[code]}` : code}
                   </s-option>
                 ))}
               </s-select>
+              {currency === "NZD" && location !== "NZ" && (
+                <s-banner tone="warning" heading="Kogan adds 15% GST to your prices">
+                  Kogan New Zealand treats stock that is not located in New Zealand as imported and
+                  adds 15% GST to the price you send. If your stock ships from New Zealand, choose
+                  “NZ – New Zealand” and save.
+                </s-banner>
+              )}
+              {settings.productLocation && (
+                <s-stack direction="inline">
+                  <s-button
+                    loading={busyIntent === "apply-location" || undefined}
+                    onClick={() => submit("apply-location")}
+                  >
+                    Send stock location {settings.productLocation} to all products now
+                  </s-button>
+                </s-stack>
+              )}
             </s-stack>
           </s-section>
 
