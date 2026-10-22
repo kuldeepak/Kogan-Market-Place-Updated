@@ -348,7 +348,16 @@ async function logImported(shop, item, productId, message) {
  * Imports one unit: either a single Kogan product, or every product of one
  * Kogan variant group found in the batch.
  */
-async function importUnit(admin, shop, settings, locationId, unit, existing, updateExisting, results) {
+async function importUnit(
+  admin,
+  shop,
+  settings,
+  locationId,
+  unit,
+  existing,
+  { updateExisting = false, onlyExisting = false } = {},
+  results,
+) {
   const fresh = [];
 
   for (const item of unit.items) {
@@ -392,6 +401,18 @@ async function importUnit(admin, shop, settings, locationId, unit, existing, upd
   }
 
   if (fresh.length === 0) return;
+
+  // "Update from Kogan" only refreshes products that are already in Shopify.
+  if (onlyExisting) {
+    for (const item of fresh) {
+      results.set(item.sku, {
+        status: "skipped",
+        productId: null,
+        message: "Not in Shopify, so there is nothing to update",
+      });
+    }
+    return;
+  }
 
   try {
     let productId = null;
@@ -454,7 +475,7 @@ export async function importKoganProducts(
   settings,
   locationId,
   koganProducts,
-  { updateExisting = false } = {},
+  { updateExisting = false, onlyExisting = false } = {},
 ) {
   const results = new Map();
   const units = [];
@@ -484,7 +505,7 @@ export async function importKoganProducts(
   const existing = skus.length > 0 ? await findExistingSkus(admin, shop, skus) : new Map();
 
   await mapWithConcurrency(units, IMPORT_CONCURRENCY, (unit) =>
-    importUnit(admin, shop, settings, locationId, unit, existing, updateExisting, results),
+    importUnit(admin, shop, settings, locationId, unit, existing, { updateExisting, onlyExisting }, results),
   );
 
   return koganProducts.map((koganProduct) => {
@@ -549,6 +570,41 @@ export function startImportJob(shop) {
     }
 
     return `Imported ${counters.created} new products. ${counters.skipped} already existed in Shopify and were skipped.`;
+  });
+}
+
+/**
+ * "Update all from Kogan": reads the whole Kogan catalogue, page by page, and
+ * refreshes every product that is already in Shopify with Kogan's data and
+ * store link. Products that are only on Kogan are left alone.
+ */
+export function startRefreshJob(shop) {
+  return startJob(shop, "refresh", async (counters, progress) => {
+    const { admin } = await unauthenticated.admin(shop);
+    const settings = await getSettings(shop);
+    const kogan = createKoganClient(settings);
+    const locationId = await getPrimaryLocationId(admin, shop);
+
+    for await (const page of kogan.listProducts({ pageSize: 100 })) {
+      counters.total += page.length;
+      await progress(true);
+
+      const results = await importKoganProducts(admin, shop, settings, locationId, page, {
+        updateExisting: true,
+        onlyExisting: true,
+      });
+
+      for (const result of results) {
+        if (result.status === "updated") counters.updated += 1;
+        else if (result.status === "failed") counters.failed += 1;
+        else counters.skipped += 1;
+        counters.processed += 1;
+      }
+
+      await progress(true);
+    }
+
+    return `Updated ${counters.updated} Shopify products from Kogan. ${counters.skipped} Kogan products are not in Shopify and were left alone.`;
   });
 }
 
@@ -1835,6 +1891,7 @@ const NZ_GST_RATE = 0.15;
 const MAX_VERIFY_ATTEMPTS = 3;
 const VERIFY_BATCH_SIZE = 50;
 const NEW_LISTING_GRACE_MS = 60 * 60 * 1000;
+const STORE_LINK_RECHECK_MS = 6 * 60 * 60 * 1000;
 
 export function nextVerifyTime() {
   return new Date(Date.now() + VERIFY_DELAY_MS);
@@ -1904,6 +1961,21 @@ function findUnappliedFields(link, sent, koganProduct) {
  * is sent again, up to three times, before the product is flagged as an error.
  */
 export async function verifyKoganState(shop) {
+  // Products listed from Shopify have no Kogan store link yet. They are
+  // checked against Kogan (at most every few hours) so "View on Kogan" fills
+  // in by itself.
+  await prisma.koganProductLink.updateMany({
+    where: {
+      shop,
+      koganStoreUrl: null,
+      verifyAfter: null,
+      pendingTaskUrl: null,
+      syncStatus: "synced",
+      updatedAt: { lt: new Date(Date.now() - STORE_LINK_RECHECK_MS) },
+    },
+    data: { verifyAfter: new Date() },
+  });
+
   const links = await prisma.koganProductLink.findMany({
     where: { shop, verifyAfter: { lte: new Date() }, pendingTaskUrl: null },
     orderBy: { verifyAfter: "asc" },
@@ -1945,6 +2017,11 @@ export async function verifyKoganState(shop) {
       continue;
     }
 
+    const storeUrl = koganProduct.store_urls?.[0]?.url || null;
+    if (storeUrl && storeUrl !== link.koganStoreUrl) {
+      await prisma.koganProductLink.update({ where: { id: link.id }, data: { koganStoreUrl: storeUrl } });
+    }
+
     const differences = findUnappliedFields(link, sent, koganProduct);
 
     if (differences.length === 0) {
@@ -1952,16 +2029,19 @@ export async function verifyKoganState(shop) {
         where: { id: link.id },
         data: { verifyAfter: null, verifyAttempts: 0, syncStatus: "synced", syncError: null, koganHost: hostOf(kogan) },
       });
-      await logSync(shop, {
-        direction: "shopify_to_kogan",
-        action: "update",
-        status: "success",
-        sku: link.koganSku,
-        productId: link.shopifyProductId,
-        title: sent.title || link.koganSku,
-        message: "Confirmed on Kogan: the product on Kogan matches Shopify.",
-        taskId: link.lastTaskId,
-      });
+      // Routine re-checks of products that were already synced are not logged.
+      if (link.syncStatus !== "synced") {
+        await logSync(shop, {
+          direction: "shopify_to_kogan",
+          action: "update",
+          status: "success",
+          sku: link.koganSku,
+          productId: link.shopifyProductId,
+          title: sent.title || link.koganSku,
+          message: "Confirmed on Kogan: the product on Kogan matches Shopify.",
+          taskId: link.lastTaskId,
+        });
+      }
       continue;
     }
 

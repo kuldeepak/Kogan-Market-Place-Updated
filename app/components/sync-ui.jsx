@@ -128,18 +128,25 @@ export function useJobPolling(job) {
 export function JobBanner({ job }) {
   if (!job) return null;
 
-  const isImport = job.type === "import";
-  const label = isImport
-    ? "Import from Kogan"
-    : job.type === "location"
-      ? "Stock location update"
-      : "Push to Kogan";
+  const isRefresh = job.type === "refresh";
+  // Imports and refreshes read the Kogan catalogue, whose size is not known
+  // in advance.
+  const isImport = job.type === "import" || isRefresh;
+  const label = isRefresh
+    ? "Update from Kogan"
+    : job.type === "import"
+      ? "Import from Kogan"
+      : job.type === "location"
+        ? "Stock location update"
+        : "Push to Kogan";
 
   if (job.status === "running") {
     // Kogan does not report a catalogue size, so imports show an open-ended
     // progress bar with running totals instead of a percentage.
     const percent = !isImport && job.total > 0 ? Math.round((job.processed / job.total) * 100) : undefined;
-    const counts = isImport
+    const counts = isRefresh
+      ? `${job.processed} Kogan products checked · ${job.updated} updated in Shopify · ${job.skipped} not in Shopify · ${job.failed} failed`
+      : isImport
       ? `${job.processed} products checked · ${job.created} imported · ${job.skipped} already existed · ${job.failed} failed`
       : `${job.processed} of ${job.total} products processed · ${job.created} created · ${job.updated} updated · ${job.failed} failed`;
 

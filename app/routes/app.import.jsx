@@ -11,6 +11,7 @@ import {
   getLatestJob,
   importSkus,
   startImportJob,
+  startRefreshJob,
 } from "../kogan/sync.server";
 import {
   ImportStatusBadge,
@@ -102,6 +103,11 @@ export const action = async ({ request }) => {
     return { intent, jobId: job.id };
   }
 
+  if (intent === "update-all") {
+    const job = await startRefreshJob(session.shop);
+    return { intent, jobId: job.id };
+  }
+
   let skus = [];
   try {
     skus = JSON.parse(String(formData.get("skus") || "[]")).map(String).slice(0, 50);
@@ -190,6 +196,10 @@ export default function ImportProducts() {
   });
 
   const newSkus = viewRows.filter((row) => row.status === "new" || row.status === "failed").map((row) => row.sku);
+  const existingSkus = viewRows
+    .filter((row) => row.status === "exists" || row.status === "updated")
+    .map((row) => row.sku);
+  const busyIntent = fetcher.state !== "idle" ? fetcher.formData?.get("intent") : null;
   const pageCounts = {
     imported: viewRows.filter((row) => row.status === "imported").length,
     exists: viewRows.filter((row) => row.status === "exists").length,
@@ -237,6 +247,66 @@ export default function ImportProducts() {
       >
         Import all products
       </s-button>
+
+      <s-button
+        slot="secondary-actions"
+        icon="refresh"
+        commandFor="update-all-modal"
+        command="--show"
+        disabled={jobRunning || Boolean(error) || undefined}
+      >
+        Update all from Kogan
+      </s-button>
+
+      <s-modal id="update-all-modal" heading="Update all products from Kogan?">
+        <s-stack gap="base">
+          <s-paragraph>
+            Every Kogan product that is already in Shopify is updated with Kogan’s title,
+            description, brand, category, images, barcode, price and stock, and gets its
+            “View on Kogan” link. Products that are only on Kogan are not imported.
+          </s-paragraph>
+          <s-banner tone="warning">
+            This overwrites those fields in Shopify with the values on Kogan. If you changed
+            products in Shopify that have not reached Kogan yet, those changes are replaced. A
+            “Kogan price” metafield is updated instead of the Shopify price.
+          </s-banner>
+          <s-paragraph>
+            It runs in the background; progress is shown here and on the dashboard.
+          </s-paragraph>
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          commandFor="update-all-modal"
+          command="--hide"
+          onClick={() => jobFetcher.submit({ intent: "update-all" }, { method: "post" })}
+        >
+          Update all from Kogan
+        </s-button>
+        <s-button slot="secondary-actions" commandFor="update-all-modal" command="--hide">
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal id="update-page-modal" heading="Update these products from Kogan?">
+        <s-paragraph>
+          {existingSkus.length} product{existingSkus.length === 1 ? "" : "s"} on this page will be
+          updated in Shopify with Kogan’s data (title, description, images, price and stock). Any
+          Shopify changes that have not reached Kogan yet are replaced.
+        </s-paragraph>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          commandFor="update-page-modal"
+          command="--hide"
+          onClick={() => submitSkus(existingSkus, "update")}
+        >
+          Update {existingSkus.length} product{existingSkus.length === 1 ? "" : "s"}
+        </s-button>
+        <s-button slot="secondary-actions" commandFor="update-page-modal" command="--hide">
+          Cancel
+        </s-button>
+      </s-modal>
 
       <s-modal id="import-all-modal" heading="Import your whole Kogan catalogue?">
         <s-stack gap="base">
@@ -321,13 +391,24 @@ export default function ImportProducts() {
                 <s-button
                   icon="import"
                   disabled={newSkus.length === 0 || fetcher.state !== "idle" || undefined}
-                  loading={(fetcher.state !== "idle" && busySkus.size > 1) || undefined}
+                  loading={(busyIntent === "import" && busySkus.size > 1) || undefined}
                   onClick={() => submitSkus(newSkus)}
                 >
                   {newSkus.length > 0
                     ? `Import this page (${newSkus.length})`
                     : "Everything on this page is imported"}
                 </s-button>
+                {existingSkus.length > 0 && (
+                  <s-button
+                    icon="refresh"
+                    disabled={fetcher.state !== "idle" || undefined}
+                    loading={(busyIntent === "update" && busySkus.size > 1) || undefined}
+                    commandFor="update-page-modal"
+                    command="--show"
+                  >
+                    {`Update this page from Kogan (${existingSkus.length})`}
+                  </s-button>
+                )}
               </s-stack>
             </s-stack>
 
