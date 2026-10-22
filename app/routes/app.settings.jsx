@@ -6,7 +6,15 @@ import { CategoryPicker } from "../components/category-picker";
 import { authenticate } from "../shopify.server";
 import { DEFAULT_API_BASE_URL, createKoganClient } from "../kogan/kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "../kogan/categories.server";
-import { startLocationJob } from "../kogan/sync.server";
+import { scheduleFullKoganCheck, startLocationJob } from "../kogan/sync.server";
+
+function apiHost(apiBaseUrl) {
+  try {
+    return new URL(apiBaseUrl || DEFAULT_API_BASE_URL).host;
+  } catch {
+    return null;
+  }
+}
 import {
   SUPPORTED_CURRENCIES,
   getSettings,
@@ -134,6 +142,15 @@ export const action = async ({ request }) => {
     }
   }
 
+  if (formData.get("intent") === "check-all") {
+    const count = await scheduleFullKoganCheck(session.shop);
+    return {
+      intent: "check-all",
+      ok: true,
+      message: `Checking ${count} SKUs on Kogan. Missing ones are listed again automatically`,
+    };
+  }
+
   if (formData.get("intent") === "apply-location") {
     if (!current.productLocation) {
       return { intent: "apply-location", ok: false, message: "Choose and save a stock location first" };
@@ -152,6 +169,17 @@ export const action = async ({ request }) => {
   }
 
   await saveSettings(session.shop, values);
+
+  // Kogan cannot move listings between its test and live environments, so
+  // after a switch every product is checked and missing ones are listed again.
+  if (apiHost(values.apiBaseUrl) !== apiHost(current.apiBaseUrl)) {
+    const count = await scheduleFullKoganCheck(session.shop);
+    return {
+      intent: "save",
+      ok: true,
+      message: `Settings saved. Kogan environment changed: checking ${count} SKUs and listing missing ones again`,
+    };
+  }
 
   // A new stock location is applied to every product already on Kogan.
   if (values.productLocation && values.productLocation !== current.productLocation) {
@@ -240,14 +268,25 @@ export default function Settings() {
                 details="Leave empty to use the default. Use the production URL Kogan gives you when you go live."
                 error={errors.apiBaseUrl}
               />
-              <s-stack direction="inline">
+              <s-stack direction="inline" gap="small">
                 <s-button
                   loading={busyIntent === "test" || undefined}
                   onClick={() => submit("test")}
                 >
                   Test connection
                 </s-button>
+                <s-button
+                  loading={busyIntent === "check-all" || undefined}
+                  onClick={() => submit("check-all")}
+                >
+                  Check all products on Kogan
+                </s-button>
               </s-stack>
+              <s-text color="subdued">
+                Kogan keeps its test and live environments separate. After switching the API
+                URL, every product is checked on the new environment and products Kogan does
+                not have yet are created there automatically.
+              </s-text>
             </s-stack>
           </s-section>
 

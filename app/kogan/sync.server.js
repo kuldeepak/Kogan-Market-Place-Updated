@@ -139,6 +139,23 @@ async function startJob(shop, type, runner) {
 
 const IMPORT_CONCURRENCY = 3;
 
+/**
+ * Kogan keeps test (UAT) and live listings completely apart and cannot move
+ * listings between them, so every link remembers the Kogan API host it was
+ * created on.
+ */
+function hostOf(kogan) {
+  return new URL(kogan.baseUrl).host;
+}
+
+async function currentKoganHost(shop) {
+  try {
+    return hostOf(createKoganClient(await getSettings(shop)));
+  } catch {
+    return null;
+  }
+}
+
 function categoryOf(fields) {
   const value = typeof fields?.category === "string" ? fields.category.trim() : "";
   return value || null;
@@ -238,6 +255,7 @@ async function saveLink(admin, shop, productId, sku, mapped, product) {
     koganImagesKey: imagesKey(mapped.images),
     koganStoreUrl: mapped.storeUrl,
     koganGroupId: mapped.variantGroup?.groupId ?? null,
+    koganHost: await currentKoganHost(shop),
     snapshot: snapshot ? JSON.stringify(snapshot.fields) : null,
     koganCategory: categoryOf(snapshot?.fields),
     syncStatus: "synced",
@@ -828,8 +846,26 @@ export async function pushProductToKogan(admin, shop, productId, { reason = "web
 
   for (const snapshot of snapshots) {
     let link = links.find((item) => item.koganSku === snapshot.sku);
+    let relisting = reason === "relist";
 
     try {
+      if (link && link.koganHost && link.koganHost !== hostOf(kogan)) {
+        // Listed on another Kogan environment (for example the test one):
+        // Kogan cannot update it here, it has to be created again.
+        await prisma.koganProductLink.deleteMany({ where: { id: link.id } });
+        await logSync(shop, {
+          direction: "shopify_to_kogan",
+          action: "create",
+          status: "success",
+          sku: snapshot.sku,
+          productId: product.id,
+          title: snapshot.fields.title,
+          message: `This SKU was listed on ${link.koganHost}, but the app now uses ${hostOf(kogan)}. Kogan does not copy listings between environments, so the app is creating it ${RELIST_NOTE}.`,
+        });
+        link = undefined;
+        relisting = true;
+      }
+
       if (link && link.shopifyProductId !== product.id) {
         // The SKU was moved to another Shopify product; follow it.
         link = await prisma.koganProductLink.update({
@@ -842,7 +878,7 @@ export async function pushProductToKogan(admin, shop, productId, { reason = "web
         const adopted = await adoptExistingKoganProduct(kogan, shop, settings, product, snapshot);
         if (adopted) {
           link = adopted;
-        } else if (settings.createOnKogan) {
+        } else if (settings.createOnKogan || relisting) {
           const created = await createOnKogan(kogan, shop, settings, product, snapshot);
           result[created ? "created" : "failed"] += 1;
           continue;
@@ -883,6 +919,7 @@ async function adoptExistingKoganProduct(kogan, shop, settings, product, snapsho
       shipping: mapped.shipping,
       koganImagesKey: imagesKey(mapped.images),
       koganStoreUrl: mapped.storeUrl,
+      koganHost: hostOf(kogan),
       koganGroupId: mapped.variantGroup?.groupId ?? null,
       snapshot: null,
       syncStatus: "pending",
@@ -1013,8 +1050,9 @@ function isVariantProblem(problem) {
   return /variant|facet|vary/i.test(problem);
 }
 
-function collectWarnings(response) {
-  return response.warnings?.length ? [formatKoganErrors(response.warnings)] : [];
+function collectWarnings(response, sku = null) {
+  const warnings = (response.warnings || []).filter((entry) => !sku || entry.product_sku === sku);
+  return warnings.length ? [formatKoganErrors(warnings)] : [];
 }
 
 async function logVariantRejection(shop, product, sku, problems) {
@@ -1172,6 +1210,94 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
   return "updated";
 }
 
+const RELIST_NOTE = "with a new listing (Product Create / POST)";
+const MAX_RELISTS_PER_DAY = 2;
+
+function missingSkuMessage(sku) {
+  return `SKU ${sku} does not exist in this Kogan account, so it cannot be updated. Kogan only updates products that were created in the same environment (products listed on Kogan's test environment must be listed again on the live one). The app is creating it ${RELIST_NOTE}.`;
+}
+
+function relistLimitMessage(sku, problems) {
+  return `Kogan still reports SKU ${sku} as not found (${problems.join(" | ")}), although the app created it again ${MAX_RELISTS_PER_DAY} times in the last 24 hours. Send the Kogan task ID to Kogan support.`;
+}
+
+/**
+ * Stops a product from being created again and again when Kogan keeps
+ * rejecting it, for example while a new listing waits for Kogan's approval.
+ */
+async function relistLimitReached(shop, sku) {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const count = await prisma.syncLog.count({
+    where: { shop, sku, message: { contains: RELIST_NOTE }, createdAt: { gte: since } },
+  });
+  return count >= MAX_RELISTS_PER_DAY;
+}
+
+/**
+ * Used when Kogan reports a linked SKU as not found outside a push (a task
+ * that finished late, the stock location job, or the verification step).
+ * When Kogan really has no such SKU, the link is removed and the product is
+ * pushed again, which creates it with Product Create (POST).
+ */
+async function relistMissingSku(kogan, shop, link, problems, taskIds = []) {
+  const taskId = taskIds.filter(Boolean).join(", ") || link.lastTaskId || null;
+  let title = null;
+  try {
+    title = link.snapshot ? JSON.parse(link.snapshot).title : null;
+  } catch {
+    title = null;
+  }
+
+  const fail = async (message) => {
+    await prisma.koganProductLink.updateMany({
+      where: { id: link.id },
+      data: { syncStatus: "error", syncError: message.slice(0, 2000), verifyAfter: null, pendingTaskUrl: null },
+    });
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "update",
+      status: "error",
+      sku: link.koganSku,
+      productId: link.shopifyProductId,
+      title,
+      message,
+      taskId,
+    });
+    return false;
+  };
+
+  if (await relistLimitReached(shop, link.koganSku)) {
+    return fail(relistLimitMessage(link.koganSku, problems));
+  }
+
+  let listed;
+  try {
+    listed = await kogan.getProductBySku(link.koganSku);
+  } catch (error) {
+    return fail(`${problems.join(" | ")}. The app could not check whether the SKU exists on Kogan: ${error.message}`);
+  }
+
+  if (listed) {
+    return fail(
+      `Kogan lists SKU ${link.koganSku}, but its update service cannot find it (${problems.join(" | ")}). This can only be fixed by Kogan: send them the Kogan task ID.`,
+    );
+  }
+
+  await prisma.koganProductLink.deleteMany({ where: { id: link.id } });
+  await logSync(shop, {
+    direction: "shopify_to_kogan",
+    action: "create",
+    status: "success",
+    sku: link.koganSku,
+    productId: link.shopifyProductId,
+    title,
+    message: missingSkuMessage(link.koganSku),
+    taskId,
+  });
+  schedulePush(shop, link.shopifyProductId, "relist");
+  return true;
+}
+
 function isNotFoundProblem(problem) {
   return /not found|does not exist/i.test(problem) && !/category/i.test(problem);
 }
@@ -1201,6 +1327,11 @@ async function handleMissingOnKogan(kogan, shop, product, snapshot, link, proble
   }
 
   if (!listed) {
+    if (await relistLimitReached(shop, snapshot.sku)) {
+      await recordFailure(shop, link, product, snapshot.sku, "update", relistLimitMessage(snapshot.sku, problems), taskIds);
+      return "failed";
+    }
+
     // deleteMany: a parallel sync of the same product may have removed it already.
     await prisma.koganProductLink.deleteMany({ where: { id: link.id } });
     await logSync(shop, {
@@ -1210,7 +1341,7 @@ async function handleMissingOnKogan(kogan, shop, product, snapshot, link, proble
       sku: snapshot.sku,
       productId: product.id,
       title: product.title,
-      message: `Kogan has no product with SKU ${snapshot.sku} in this account, so the app is listing it again.`,
+      message: missingSkuMessage(snapshot.sku),
       taskId: taskIds.join(", "),
     });
     const created = await createOnKogan(kogan, shop, await getSettings(shop), product, snapshot);
@@ -1229,10 +1360,15 @@ async function handleMissingOnKogan(kogan, shop, product, snapshot, link, proble
   return "failed";
 }
 
-function collectProblems(response) {
+/**
+ * With `sku`, only the errors of that SKU are returned. One Kogan task can
+ * cover up to 500 SKUs, and another SKU's error must not be shown on this one.
+ */
+function collectProblems(response, sku = null) {
   const problems = [];
+  const errors = (response.errors || []).filter((entry) => !sku || entry.product_sku === sku);
   if (response.error) problems.push(response.error);
-  if (response.errors?.length > 0) problems.push(formatKoganErrors(response.errors));
+  if (errors.length > 0) problems.push(formatKoganErrors(errors));
   if (response.status === "Failed" && problems.length === 0) {
     problems.push("Kogan rejected the update.");
   }
@@ -1327,6 +1463,7 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
     pendingTaskUrl: pendingUrls.length > 0 ? JSON.stringify(pendingUrls) : null,
     verifyAfter: nextVerifyTime(),
     lastTaskId: taskIds.at(-1) || null,
+    koganHost: hostOf(kogan),
     syncError: null,
     verifyAttempts: 0,
     lastSyncedAt: new Date(),
@@ -1420,8 +1557,8 @@ export async function checkPendingKoganTasks(shop) {
           remaining.push(url);
           continue;
         }
-        problems.push(...collectProblems(task));
-        warnings.push(...collectWarnings(task));
+        problems.push(...collectProblems(task, link.koganSku));
+        warnings.push(...collectWarnings(task, link.koganSku));
         if (task.taskIds?.length) finishedTaskIds.push(...task.taskIds);
       } catch (error) {
         if (error.status === 404) continue;
@@ -1432,6 +1569,11 @@ export async function checkPendingKoganTasks(shop) {
     const ageHours = (Date.now() - new Date(link.updatedAt).getTime()) / 3600000;
     const giveUp = remaining.length > 0 && ageHours > 24;
     const title = link.snapshot ? JSON.parse(link.snapshot).title : null;
+
+    if (problems.some(isNotFoundProblem)) {
+      await relistMissingSku(kogan, shop, link, problems, finishedTaskIds);
+      continue;
+    }
 
     if (problems.length > 0) {
       await prisma.koganProductLink.update({
@@ -1575,6 +1717,15 @@ export function startLocationJob(shop) {
       for (const link of batch) {
         counters.processed += 1;
 
+        if (failed.has(link.koganSku) && isNotFoundProblem(failed.get(link.koganSku))) {
+          if (await relistMissingSku(kogan, shop, link, [failed.get(link.koganSku)], taskIds)) {
+            counters.created += 1;
+          } else {
+            counters.failed += 1;
+          }
+          continue;
+        }
+
         if (failed.has(link.koganSku)) {
           counters.failed += 1;
           await logSync(shop, {
@@ -1618,6 +1769,19 @@ export function startLocationJob(shop) {
 
     return `Stock location ${location} sent to Kogan for ${counters.updated} of ${counters.total} SKUs.`;
   });
+}
+
+/**
+ * Schedules every linked product to be checked against Kogan on the next
+ * background run. Products Kogan does not have are listed again; the rest are
+ * confirmed or corrected. Used after the Kogan environment changes.
+ */
+export async function scheduleFullKoganCheck(shop) {
+  const result = await prisma.koganProductLink.updateMany({
+    where: { shop },
+    data: { verifyAfter: new Date(), verifyAttempts: 0 },
+  });
+  return result.count;
 }
 
 export function startPushAllJob(shop) {
@@ -1669,7 +1833,8 @@ export function startPushAllJob(shop) {
 const VERIFY_DELAY_MS = 10 * 60 * 1000;
 const NZ_GST_RATE = 0.15;
 const MAX_VERIFY_ATTEMPTS = 3;
-const VERIFY_BATCH_SIZE = 20;
+const VERIFY_BATCH_SIZE = 50;
+const NEW_LISTING_GRACE_MS = 60 * 60 * 1000;
 
 export function nextVerifyTime() {
   return new Date(Date.now() + VERIFY_DELAY_MS);
@@ -1770,14 +1935,22 @@ export async function verifyKoganState(shop) {
       continue;
     }
 
-    const differences = koganProduct
-      ? findUnappliedFields(link, sent, koganProduct)
-      : [{ field: "title", text: "listing (the product is not visible on Kogan yet)" }];
+    if (!koganProduct) {
+      // A brand-new listing can take a while to appear on Kogan.
+      if (Date.now() - new Date(link.createdAt).getTime() < NEW_LISTING_GRACE_MS) {
+        await prisma.koganProductLink.update({ where: { id: link.id }, data: { verifyAfter: nextVerifyTime() } });
+        continue;
+      }
+      await relistMissingSku(kogan, shop, link, ["The product is not on Kogan"], [link.lastTaskId]);
+      continue;
+    }
+
+    const differences = findUnappliedFields(link, sent, koganProduct);
 
     if (differences.length === 0) {
       await prisma.koganProductLink.update({
         where: { id: link.id },
-        data: { verifyAfter: null, verifyAttempts: 0, syncStatus: "synced", syncError: null },
+        data: { verifyAfter: null, verifyAttempts: 0, syncStatus: "synced", syncError: null, koganHost: hostOf(kogan) },
       });
       await logSync(shop, {
         direction: "shopify_to_kogan",

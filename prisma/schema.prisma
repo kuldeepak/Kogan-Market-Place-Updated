@@ -78,6 +78,7 @@ model KoganProductLink {
   verifyAfter       DateTime?
   verifyAttempts    Int       @default(0)
   lastTaskId        String?
+  koganHost         String?
   lastSyncedAt      DateTime?
   lastDirection     String?
   createdAt         DateTime  @default(now())
