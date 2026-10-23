@@ -25,11 +25,14 @@ import {
   updateShopifyProduct,
 } from "./shopify-products.server";
 import {
+  forgetRetiredSkus,
   formatKoganErrors,
+  getRetiredSkus,
   getSettings,
   hasSyncTag,
   logSync,
   pruneLogs,
+  retireSkus,
 } from "./store.server";
 
 const PUSH_DEBOUNCE_MS = 4000;
@@ -269,6 +272,7 @@ async function saveLink(admin, shop, productId, sku, mapped, product) {
     create: { shop, koganSku: sku, ...linkData },
     update: linkData,
   });
+  await forgetRetiredSkus(shop, [sku]);
 }
 
 function koganPriceTargetFor(product, variant) {
@@ -475,7 +479,7 @@ export async function importKoganProducts(
   settings,
   locationId,
   koganProducts,
-  { updateExisting = false, onlyExisting = false } = {},
+  { updateExisting = false, onlyExisting = false, skipRetired = false } = {},
 ) {
   const results = new Map();
   const units = [];
@@ -503,6 +507,23 @@ export async function importKoganProducts(
 
   const skus = units.flatMap((unit) => unit.items.map((item) => item.sku));
   const existing = skus.length > 0 ? await findExistingSkus(admin, shop, skus) : new Map();
+
+  if (skipRetired && skus.length > 0) {
+    // Old listings of SKUs that were deleted or renamed in Shopify would come
+    // back as duplicates, so they are left on Kogan only.
+    const retired = await getRetiredSkus(shop, skus);
+    for (const unit of units) {
+      unit.items = unit.items.filter((item) => {
+        if (existing.has(item.sku) || !retired.has(item.sku)) return true;
+        results.set(item.sku, {
+          status: "skipped",
+          productId: null,
+          message: "Hidden: this SKU was removed or changed in Shopify",
+        });
+        return false;
+      });
+    }
+  }
 
   await mapWithConcurrency(units, IMPORT_CONCURRENCY, (unit) =>
     importUnit(admin, shop, settings, locationId, unit, existing, { updateExisting, onlyExisting }, results),
@@ -552,16 +573,20 @@ export function startImportJob(shop) {
     const settings = await getSettings(shop);
     const kogan = createKoganClient(settings);
     const locationId = await getPrimaryLocationId(admin, shop);
+    let hidden = 0;
 
     for await (const page of kogan.listProducts({ pageSize: 100 })) {
       counters.total += page.length;
       await progress(true);
 
-      const results = await importKoganProducts(admin, shop, settings, locationId, page);
+      const results = await importKoganProducts(admin, shop, settings, locationId, page, {
+        skipRetired: true,
+      });
 
       for (const result of results) {
         if (result.status === "imported") counters.created += 1;
         else if (result.status === "exists") counters.skipped += 1;
+        else if (result.status === "skipped") hidden += 1;
         else if (result.status === "failed") counters.failed += 1;
         counters.processed += 1;
       }
@@ -569,7 +594,10 @@ export function startImportJob(shop) {
       await progress(true);
     }
 
-    return `Imported ${counters.created} new products. ${counters.skipped} already existed in Shopify and were skipped.`;
+    const hiddenNote = hidden > 0
+      ? ` ${hidden} old Kogan listings of SKUs removed or changed in Shopify were not imported.`
+      : "";
+    return `Imported ${counters.created} new products. ${counters.skipped} already existed in Shopify and were skipped.${hiddenNote}`;
   });
 }
 
@@ -823,6 +851,7 @@ async function removeDeletedVariants(kogan, shop, settings, product, currentSkus
     }
 
     await prisma.koganProductLink.delete({ where: { id: link.id } });
+    await retireSkus(shop, [{ sku: link.koganSku, title }], "removed");
   }
 }
 
@@ -960,6 +989,7 @@ async function adoptExistingKoganProduct(kogan, shop, settings, product, snapsho
   if (!koganProduct) return null;
 
   const mapped = mapKoganToShopify(koganProduct, settings);
+  await forgetRetiredSkus(shop, [snapshot.sku]);
 
   // The previous snapshot is unknown, so it is left empty and every field is
   // treated as changed: Shopify becomes the source of truth for this product.
@@ -1532,6 +1562,7 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
     create: { shop, koganSku: snapshot.sku, ...linkData },
     update: linkData,
   });
+  await forgetRetiredSkus(shop, [snapshot.sku]);
 
   const base = grouped
     ? "Sent to Kogan as a new listing (a variant of the product). The app confirms it on Kogan in about 10 minutes"
@@ -2201,6 +2232,11 @@ export async function handleProductDeleted(shop, productId) {
   }
 
   await prisma.koganProductLink.deleteMany({ where: { shop, shopifyProductId: productId } });
+  await retireSkus(
+    shop,
+    links.map((link) => ({ sku: link.koganSku, title: link.snapshot ? JSON.parse(link.snapshot).title : null })),
+    "removed",
+  );
 }
 
 export async function scheduleInventoryPush(shop, inventoryItemId) {

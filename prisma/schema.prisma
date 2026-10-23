@@ -92,6 +92,19 @@ model KoganProductLink {
   @@index([shop, koganCategory])
 }
 
+// Kogan SKUs that are no longer used in Shopify (the variant was deleted or
+// its SKU changed) or that the merchant hid. Kogan cannot delete listings, so
+// these stay in the Kogan catalogue and are hidden on the import screen.
+model KoganRetiredSku {
+  shop      String
+  koganSku  String
+  reason    String
+  title     String?
+  createdAt DateTime @default(now())
+
+  @@id([shop, koganSku])
+}
+
 model SyncJob {
   id         String    @id @default(cuid())
   shop       String

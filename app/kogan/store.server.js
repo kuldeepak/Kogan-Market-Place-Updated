@@ -53,6 +53,35 @@ export function hasSyncTag(tags, syncTag) {
   return (tags || []).some((tag) => tag.trim().toLowerCase() === wanted);
 }
 
+/**
+ * Remembers Kogan SKUs that Shopify no longer uses. Kogan has no delete
+ * endpoint, so their old listings stay in the Kogan catalogue; the import
+ * screen hides them and "Import all" skips them so they are not imported back
+ * as duplicates.
+ */
+export async function retireSkus(shop, entries, reason) {
+  for (const { sku, title } of entries) {
+    if (!sku) continue;
+    await prisma.koganRetiredSku.upsert({
+      where: { shop_koganSku: { shop, koganSku: sku } },
+      create: { shop, koganSku: sku, reason, title: title ?? null },
+      update: { reason, title: title ?? undefined },
+    });
+  }
+}
+
+export async function forgetRetiredSkus(shop, skus) {
+  if (skus.length === 0) return;
+  await prisma.koganRetiredSku.deleteMany({ where: { shop, koganSku: { in: skus } } });
+}
+
+export async function getRetiredSkus(shop, skus) {
+  const rows = await prisma.koganRetiredSku.findMany({
+    where: { shop, ...(skus ? { koganSku: { in: skus } } : {}) },
+  });
+  return new Map(rows.map((row) => [row.koganSku, row]));
+}
+
 export async function logSync(shop, entry) {
   try {
     await prisma.syncLog.create({

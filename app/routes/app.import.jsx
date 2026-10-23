@@ -1,11 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
-import { useFetcher, useLoaderData, useNavigate, useNavigation, useSearchParams } from "react-router";
+import {
+  useFetcher,
+  useLoaderData,
+  useNavigate,
+  useNavigation,
+  useRevalidator,
+  useSearchParams,
+} from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { createKoganClient } from "../kogan/kogan-client.server";
 import { pickOffer, variantGroupOf } from "../kogan/mapping.server";
-import { getSettings, hasKoganCredentials } from "../kogan/store.server";
+import {
+  forgetRetiredSkus,
+  getRetiredSkus,
+  getSettings,
+  hasKoganCredentials,
+  retireSkus,
+} from "../kogan/store.server";
 import {
   findExistingSkus,
   getLatestJob,
@@ -39,10 +52,20 @@ export const loader = async ({ request }) => {
   const history = parseHistory(url.searchParams.get("history"));
   const query = (url.searchParams.get("q") || "").trim();
   const searchBy = url.searchParams.get("by") === "sku" ? "sku" : "title";
+  const showHidden = url.searchParams.get("hidden") === "1";
 
   const settings = await getSettings(shop);
   const latestJob = await getLatestJob(shop);
-  const base = { cursor, history, query, searchBy, latestJob, page: history.length + 1 };
+  const base = {
+    cursor,
+    history,
+    query,
+    searchBy,
+    showHidden,
+    hiddenCount: 0,
+    latestJob,
+    page: history.length + 1,
+  };
 
   if (!hasKoganCredentials(settings)) {
     return { ...base, rows: [], nextCursor: null, error: "Add your Kogan credentials in Settings first." };
@@ -59,12 +82,16 @@ export const loader = async ({ request }) => {
 
     const skus = results.map((item) => item.product_sku?.trim()).filter(Boolean);
     const existing = skus.length > 0 ? await findExistingSkus(admin, shop, skus) : new Map();
+    const retired = skus.length > 0 ? await getRetiredSkus(shop, skus) : new Map();
 
-    const rows = results.map((item) => {
+    const allRows = results.map((item) => {
       const sku = item.product_sku?.trim() || "";
       const { currency, offer } = pickOffer(item, settings.currency);
       const match = existing.get(sku);
       const group = variantGroupOf(item);
+      // Only listings that are not in Shopify can be hidden; a SKU that is
+      // used in Shopify again is always shown.
+      const hiddenReason = !match ? retired.get(sku)?.reason || null : null;
 
       return {
         sku,
@@ -84,10 +111,14 @@ export const loader = async ({ request }) => {
           : null,
         status: match ? "exists" : "new",
         productId: match?.productId || null,
+        hiddenReason,
       };
     });
 
-    return { ...base, rows, nextCursor, error: null };
+    const rows = showHidden ? allRows : allRows.filter((row) => !row.hiddenReason);
+    const hiddenCount = allRows.filter((row) => row.hiddenReason).length;
+
+    return { ...base, rows, hiddenCount, nextCursor, error: null };
   } catch (error) {
     return { ...base, rows: [], nextCursor: null, error: error.message };
   }
@@ -119,6 +150,21 @@ export const action = async ({ request }) => {
     return { intent, results: [], error: "No products were selected." };
   }
 
+  if (intent === "hide") {
+    const titles = JSON.parse(String(formData.get("titles") || "{}"));
+    await retireSkus(
+      session.shop,
+      skus.map((sku) => ({ sku, title: titles[sku] || null })),
+      "hidden",
+    );
+    return { intent, results: [], message: skus.length === 1 ? "Hidden from this list" : `${skus.length} hidden`, error: null };
+  }
+
+  if (intent === "unhide") {
+    await forgetRetiredSkus(session.shop, skus);
+    return { intent, results: [], message: "Shown in the list again", error: null };
+  }
+
   try {
     const results = await importSkus(admin, session.shop, skus, {
       updateExisting: intent === "update",
@@ -140,10 +186,22 @@ function summarise(results) {
 }
 
 export default function ImportProducts() {
-  const { rows, nextCursor, history, cursor, page, query, searchBy, error, latestJob } =
-    useLoaderData();
+  const {
+    rows,
+    nextCursor,
+    history,
+    cursor,
+    page,
+    query,
+    searchBy,
+    showHidden,
+    hiddenCount,
+    error,
+    latestJob,
+  } = useLoaderData();
   const fetcher = useFetcher();
   const jobFetcher = useFetcher();
+  const revalidator = useRevalidator();
   const navigation = useNavigation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -158,6 +216,11 @@ export default function ImportProducts() {
 
     if (fetcher.data.error) {
       shopify.toast.show(fetcher.data.error, { isError: true });
+      return;
+    }
+
+    if (fetcher.data.message) {
+      shopify.toast.show(fetcher.data.message);
       return;
     }
 
@@ -195,7 +258,9 @@ export default function ImportProducts() {
       : row;
   });
 
-  const newSkus = viewRows.filter((row) => row.status === "new" || row.status === "failed").map((row) => row.sku);
+  const newSkus = viewRows
+    .filter((row) => (row.status === "new" || row.status === "failed") && !row.hiddenReason)
+    .map((row) => row.sku);
   const existingSkus = viewRows
     .filter((row) => row.status === "exists" || row.status === "updated")
     .map((row) => row.sku);
@@ -236,6 +301,12 @@ export default function ImportProducts() {
   const submitSkus = (skus, intent = "import") =>
     fetcher.submit({ intent, skus: JSON.stringify(skus) }, { method: "post" });
 
+  const hideRow = (row) =>
+    fetcher.submit(
+      { intent: "hide", skus: JSON.stringify([row.sku]), titles: JSON.stringify({ [row.sku]: row.title }) },
+      { method: "post" },
+    );
+
   return (
     <s-page heading="Import from Kogan" inlineSize="large">
       <s-button
@@ -256,6 +327,14 @@ export default function ImportProducts() {
         disabled={jobRunning || Boolean(error) || undefined}
       >
         Update all from Kogan
+      </s-button>
+
+      <s-button
+        slot="secondary-actions"
+        loading={revalidator.state === "loading" || undefined}
+        onClick={() => revalidator.revalidate()}
+      >
+        Refresh list
       </s-button>
 
       <s-modal id="update-all-modal" heading="Update all products from Kogan?">
@@ -313,7 +392,8 @@ export default function ImportProducts() {
           <s-paragraph>
             Every Kogan product is checked in the background, 100 at a time. Products whose SKU
             already exists in Shopify are skipped and marked as “Already exists”, so nothing is
-            duplicated.
+            duplicated. Hidden listings (old SKUs that were removed or changed in Shopify) are
+            not imported.
           </s-paragraph>
           <s-paragraph>
             Large catalogues can take a while. You can close this page; progress is shown on the
@@ -387,6 +467,11 @@ export default function ImportProducts() {
                   <s-badge tone="success">{pageCounts.imported} imported</s-badge>
                   <s-badge tone="warning">{pageCounts.exists} already exist</s-badge>
                   <s-badge tone="neutral">{pageCounts.pending} not imported</s-badge>
+                  {(hiddenCount > 0 || showHidden) && (
+                    <s-button variant="tertiary" onClick={() => go({ hidden: showHidden ? null : "1" })}>
+                      {showHidden ? "Hide hidden listings" : `Show hidden (${hiddenCount})`}
+                    </s-button>
+                  )}
                 </s-stack>
                 <s-button
                   icon="import"
@@ -448,7 +533,11 @@ export default function ImportProducts() {
                         <s-stack direction="inline" gap="small-200">
                           <ImportStatusBadge status={row.status} />
                           {!row.listed && <s-badge tone="neutral">Not listed on Kogan</s-badge>}
+                          {row.hiddenReason && <s-badge tone="neutral">Hidden</s-badge>}
                         </s-stack>
+                        {row.hiddenReason === "removed" && (
+                          <s-text color="subdued">Old listing: this SKU was removed or changed in Shopify</s-text>
+                        )}
                         {row.status === "failed" && row.message && (
                           <s-text tone="critical">{row.message.slice(0, 160)}</s-text>
                         )}
@@ -464,6 +553,17 @@ export default function ImportProducts() {
                             onClick={() => submitSkus([row.sku])}
                           >
                             Import
+                          </s-button>
+                        )}
+                        {!inShopify && row.sku && (
+                          <s-button
+                            variant="tertiary"
+                            disabled={fetcher.state !== "idle" || undefined}
+                            onClick={() =>
+                              row.hiddenReason ? submitSkus([row.sku], "unhide") : hideRow(row)
+                            }
+                          >
+                            {row.hiddenReason ? "Unhide" : "Hide"}
                           </s-button>
                         )}
                         {inShopify && row.productId && (
@@ -492,7 +592,11 @@ export default function ImportProducts() {
           {rows.length === 0 && !error && (
             <s-box padding="base">
               <s-text color="subdued">
-                {query ? `No Kogan products match “${query}”.` : "No products found in your Kogan account."}
+                {hiddenCount > 0
+                  ? "Every product on this page is hidden. Go to the next page, or use “Show hidden”."
+                  : query
+                    ? `No Kogan products match “${query}”.`
+                    : "No products found in your Kogan account."}
               </s-text>
             </s-box>
           )}
