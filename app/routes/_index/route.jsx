@@ -6,7 +6,8 @@ export const loader = async ({ request }) => {
   const url = new URL(request.url);
 
   if (url.searchParams.get("shop")) {
-    throw redirect(`/app?${url.searchParams.toString()}`);
+    // Trailing slash on purpose; see the Dashboard link in routes/app.jsx.
+    throw redirect(`/app/?${url.searchParams.toString()}`);
   }
 
   return { showForm: Boolean(login) };

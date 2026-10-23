@@ -363,7 +363,7 @@ export default function Products() {
               Import your Kogan catalogue from the dashboard, or add the “{syncTag}” tag to a
               Shopify product to list it on Kogan.
             </s-paragraph>
-            <s-button slot="primary-action" variant="primary" href="/app">
+            <s-button slot="primary-action" variant="primary" href="/app/">
               Go to dashboard
             </s-button>
           </s-empty-state>

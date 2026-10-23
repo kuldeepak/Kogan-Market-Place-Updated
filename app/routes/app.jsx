@@ -21,7 +21,10 @@ export default function App() {
   return (
     <AppProvider embedded apiKey={apiKey}>
       <s-app-nav>
-        <s-link href="/app">Dashboard</s-link>
+        {/* "/app/" rather than "/app": when the project folder is the web root
+            (Cloudways), Apache answers "/app" itself with a redirect to the
+            "app/" source folder over http, and the app never loads. */}
+        <s-link href="/app/">Dashboard</s-link>
         <s-link href="/app/import">Import</s-link>
         <s-link href="/app/products">Products</s-link>
         <s-link href="/app/categories">Categories</s-link>
