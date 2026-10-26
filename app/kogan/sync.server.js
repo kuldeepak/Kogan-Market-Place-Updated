@@ -813,6 +813,87 @@ export async function attachVariantGroups(shop, product, snapshots, known = {}) 
 }
 
 /**
+ * The sync tag was removed from a product that is listed on Kogan. As Kogan
+ * support advises, its listings are disabled by setting their Kogan stock to
+ * 0 (Kogan removes listings that stay without updates for 7 days). Shopify's
+ * own inventory is not touched. SKUs Kogan accepted are removed from the
+ * app's product list; anything that could not be sent stays listed and is
+ * retried on the product's next update.
+ *
+ * Returns true when at least one SKU was taken off sale.
+ */
+async function stopSellingUntaggedProduct(shop, settings, product) {
+  const links = await prisma.koganProductLink.findMany({
+    where: { shop, shopifyProductId: product.id },
+  });
+  if (links.length === 0) return false;
+
+  const kogan = createKoganClient(settings);
+  let response;
+  try {
+    response = await kogan.updateStockAndPrice(
+      links.map((link) => ({ product_sku: link.koganSku, stock: 0 })),
+    );
+  } catch (error) {
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "delete",
+      status: "error",
+      sku: links.map((link) => link.koganSku).join(", "),
+      productId: product.id,
+      title: product.title,
+      message: `The "${settings.syncTag}" tag was removed, but Kogan could not be reached to set the stock to 0: ${error.message}. It is tried again on the product's next update.`,
+    });
+    return false;
+  }
+
+  const taskId = (response.taskIds || []).join(", ") || null;
+  const removed = [];
+
+  for (const link of links) {
+    const problems = collectProblems(response, link.koganSku);
+    // A SKU Kogan does not have is not on sale there, so it can go too.
+    const notOnKogan = problems.length > 0 && problems.every(isNotFoundProblem);
+
+    if (problems.length > 0 && !notOnKogan) {
+      await prisma.koganProductLink.updateMany({
+        where: { id: link.id },
+        data: { syncStatus: "error", syncError: problems.join(" | ").slice(0, 2000), lastTaskId: taskId },
+      });
+      await logSync(shop, {
+        direction: "shopify_to_kogan",
+        action: "delete",
+        status: "error",
+        sku: link.koganSku,
+        productId: product.id,
+        title: product.title,
+        message: `The "${settings.syncTag}" tag was removed, but Kogan rejected stock 0: ${problems.join(" | ")}`,
+        taskId,
+      });
+      continue;
+    }
+
+    await prisma.koganProductLink.deleteMany({ where: { id: link.id } });
+    removed.push(link.koganSku);
+  }
+
+  if (removed.length > 0) {
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "delete",
+      status: "success",
+      sku: removed.join(", "),
+      productId: product.id,
+      title: product.title,
+      message: `The "${settings.syncTag}" tag was removed, so the Kogan stock was set to 0 and the product was removed from the app's Kogan list. Kogan removes the listing after 7 days without updates; add the tag again to sell it on Kogan again.`,
+      taskId,
+    });
+  }
+
+  return removed.length > 0;
+}
+
+/**
  * Takes variants that were deleted in Shopify (or lost their SKU) off sale on
  * Kogan, so a removed variant can no longer be ordered there.
  */
@@ -870,8 +951,14 @@ export async function pushProductToKogan(admin, shop, productId, { reason = "web
   }
 
   let product = given || (await getProductForSync(admin, productId));
-  if (!product || !hasSyncTag(product.tags, settings.syncTag)) {
+  if (!product) {
     result.skipped += 1;
+    return result;
+  }
+
+  if (!hasSyncTag(product.tags, settings.syncTag)) {
+    const removed = await stopSellingUntaggedProduct(shop, settings, product);
+    result[removed ? "updated" : "skipped"] += 1;
     return result;
   }
 
@@ -1876,12 +1963,14 @@ export function startPushAllJob(shop) {
     const { admin } = await unauthenticated.admin(shop);
     const settings = await getSettings(shop);
     let unchanged = 0;
+    const seen = new Set();
 
     for await (const products of listTaggedProducts(admin, settings.syncTag)) {
       counters.total += products.length;
       await progress(true);
 
       for (const product of products) {
+        seen.add(product.id);
         try {
           const outcome = await pushProductToKogan(admin, shop, product.id, {
             reason: "manual",
@@ -1908,8 +1997,44 @@ export function startPushAllJob(shop) {
       }
     }
 
+    // Linked products that no longer carry the tag (or were deleted) while a
+    // webhook was missed are taken off sale on Kogan here.
+    const linked = await prisma.koganProductLink.findMany({
+      where: { shop },
+      select: { shopifyProductId: true },
+      distinct: ["shopifyProductId"],
+    });
+    let removed = 0;
+
+    for (const { shopifyProductId } of linked) {
+      if (seen.has(shopifyProductId)) continue;
+      try {
+        const product = await getProductForSync(admin, shopifyProductId);
+        if (!product) {
+          await handleProductDeleted(shop, shopifyProductId);
+          removed += 1;
+          continue;
+        }
+        const outcome = await pushProductToKogan(admin, shop, shopifyProductId, {
+          reason: "manual",
+          product,
+        });
+        removed += outcome.updated;
+        counters.failed += outcome.failed;
+      } catch (error) {
+        counters.failed += 1;
+        await logSync(shop, {
+          direction: "shopify_to_kogan",
+          action: "delete",
+          status: "error",
+          productId: shopifyProductId,
+          message: error.message,
+        });
+      }
+    }
+
     await progress(true);
-    return `Created ${counters.created}, updated ${counters.updated}, already up to date ${unchanged}.`;
+    return `Created ${counters.created}, updated ${counters.updated}, already up to date ${unchanged}${removed ? `, taken off Kogan ${removed}` : ""}.`;
   });
 }
 

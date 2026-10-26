@@ -296,7 +296,7 @@ export default function Settings() {
                 name="syncTag"
                 label="Sync tag"
                 value={settings.syncTag}
-                details="Shopify products with this tag are kept in sync with Kogan. Imported products get this tag automatically."
+                details="Shopify products with this tag are kept in sync with Kogan. Imported products get this tag automatically. Removing the tag from a product sets its Kogan stock to 0 and removes it from the app (Kogan removes the listing after 7 days), so products that do not carry a new tag are taken off sale when they are next updated."
                 error={errors.syncTag}
               />
               <s-select
