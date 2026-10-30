@@ -43,6 +43,7 @@ model KoganSettings {
   defaultCategory      String?
   handlingDays         Int      @default(2)
   productLocation      String?
+  koganShipping        String?
   autoSyncEnabled      Boolean  @default(true)
   createOnKogan        Boolean  @default(true)
   zeroStockOnDelete    Boolean  @default(true)

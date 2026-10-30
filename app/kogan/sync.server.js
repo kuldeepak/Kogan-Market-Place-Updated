@@ -30,9 +30,12 @@ import {
   getRetiredSkus,
   getSettings,
   hasSyncTag,
+  koganShippingValue,
   logSync,
+  shippingModeOf,
   pruneLogs,
   retireSkus,
+  saveSettings,
 } from "./store.server";
 
 const PUSH_DEBOUNCE_MS = 4000;
@@ -48,7 +51,7 @@ const CONTENT_FIELDS = [
   "variantGroup",
   "location",
 ];
-const OFFER_FIELDS = ["price", "rrp", "stock", "enabled"];
+const OFFER_FIELDS = ["price", "rrp", "stock", "enabled", "shipping"];
 
 const activeJobs = new Set();
 const pushTimers = new Map();
@@ -247,6 +250,7 @@ async function saveLink(admin, shop, productId, sku, mapped, product) {
   });
   const snapshot = snapshots.find((item) => item.sku === sku);
   if (snapshot && mapped.location !== undefined) snapshot.fields.location = mapped.location;
+  if (snapshot && mapped.shipping !== undefined) snapshot.fields.shipping = toMoneyString(mapped.shipping);
 
   const linkData = {
     shopifyProductId: productId,
@@ -1012,6 +1016,10 @@ export async function pushProductToKogan(admin, shop, productId, { reason = "web
     for (const snapshot of snapshots) snapshot.fields.location = settings.productLocation;
   }
 
+  // Shipping is managed from Settings too: free ("0.00") or variable (empty).
+  const shipping = koganShippingValue(settings);
+  for (const snapshot of snapshots) snapshot.fields.shipping = shipping;
+
   const links = await prisma.koganProductLink.findMany({
     where: { shop, koganSku: { in: snapshots.map((item) => item.sku) } },
   });
@@ -1107,7 +1115,13 @@ function buildOfferData(link, fields) {
     handling_days: link.handlingDays,
   };
   if (fields.rrp && Number(fields.rrp) > Number(fields.price)) offer.rrp = fields.rrp;
-  if (link.shipping !== null && link.shipping !== undefined) offer.shipping = link.shipping;
+  if (fields.shipping !== undefined) {
+    // Sent even when empty, so switching from free to variable shipping
+    // clears the old carton rate on Kogan.
+    offer.shipping = fields.shipping;
+  } else if (link.shipping !== null && link.shipping !== undefined) {
+    offer.shipping = link.shipping;
+  }
   return { [link.currency]: offer };
 }
 
@@ -1247,7 +1261,7 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
 
   // Products that were linked before variant groups existed still need their
   // group sent once.
-  for (const field of ["variantGroup", "location"]) {
+  for (const field of ["variantGroup", "location", "shipping"]) {
     if (previous && !(field in previous) && next[field] && !changed.includes(field)) {
       changed.push(field);
     }
@@ -1342,7 +1356,7 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
     if (stock !== null && (offerChanges.includes("stock") || offerChanges.includes("enabled"))) {
       payload.stock = stock;
     }
-    if ((offerChanges.includes("price") || offerChanges.includes("rrp")) && next.price) {
+    if (["price", "rrp", "shipping"].some((field) => offerChanges.includes(field)) && next.price) {
       payload.offer_data = buildOfferData(link, next);
     }
 
@@ -1573,6 +1587,7 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
 
   const offer = { price: fields.price, handling_days: settings.handlingDays };
   if (fields.rrp && Number(fields.rrp) > Number(fields.price)) offer.rrp = fields.rrp;
+  if (fields.shipping !== null && fields.shipping !== undefined) offer.shipping = fields.shipping;
 
   const payload = {
     product_sku: snapshot.sku,
@@ -1846,6 +1861,7 @@ export function startLocationJob(shop) {
     const settings = await getSettings(shop);
     const location = settings.productLocation;
     if (!location) return "No stock location is set in Settings.";
+    const shipping = koganShippingValue(settings);
 
     const kogan = createKoganClient(settings);
     const links = await prisma.koganProductLink.findMany({
@@ -1873,7 +1889,7 @@ export function startLocationJob(shop) {
           ? await kogan.updateStockAndPrice(
               priced.map(({ link, fields }) => ({
                 product_sku: link.koganSku,
-                offer_data: buildOfferData(link, fields),
+                offer_data: buildOfferData(link, { ...fields, shipping }),
               })),
             )
           : { errors: [], pendingUrls: [], error: null };
@@ -1920,7 +1936,7 @@ export function startLocationJob(shop) {
         await prisma.koganProductLink.update({
           where: { id: link.id },
           data: {
-            ...(fields ? { snapshot: JSON.stringify({ ...fields, location }) } : {}),
+            ...(fields ? { snapshot: JSON.stringify({ ...fields, location, shipping }) } : {}),
             syncStatus: "pending",
             syncError: null,
             lastTaskId: taskIds.at(-1) || link.lastTaskId,
@@ -1943,6 +1959,139 @@ export function startLocationJob(shop) {
 
     return `Stock location ${location} sent to Kogan for ${counters.updated} of ${counters.total} SKUs.`;
   });
+}
+
+const SHIPPING_BATCH_SIZE = 100;
+
+function shippingLabel(shipping) {
+  return shipping === null ? "variable shipping" : "free shipping";
+}
+
+/**
+ * Sends the shipping option from Settings (free or variable) to Kogan for
+ * every linked SKU, in batches. Kogan only accepts shipping inside an offer,
+ * so each SKU's current price and handling days are sent with it. SKUs whose
+ * price is not known yet get the shipping with their next sync. `mode`
+ * overrides the saved option, for a choice that is saved once the job starts.
+ */
+export function startShippingJob(shop, mode = null) {
+  return startJob(shop, "shipping", async (counters, progress) => {
+    const settings = await getSettings(shop);
+    const shipping = koganShippingValue(mode ? { koganShipping: mode } : settings);
+    const label = shippingLabel(shipping);
+
+    const kogan = createKoganClient(settings);
+    const links = await prisma.koganProductLink.findMany({
+      where: { shop },
+      orderBy: { koganSku: "asc" },
+    });
+    counters.total = links.length;
+    await progress(true);
+
+    for (let index = 0; index < links.length; index += SHIPPING_BATCH_SIZE) {
+      const batch = links
+        .slice(index, index + SHIPPING_BATCH_SIZE)
+        .map((link) => ({ link, fields: link.snapshot ? JSON.parse(link.snapshot) : null }));
+      const priced = batch.filter(({ fields }) => typeof fields?.price === "string" && Number(fields.price) > 0);
+      const failed = new Map();
+      let pendingUrls = [];
+      let taskIds = [];
+
+      if (priced.length > 0) {
+        try {
+          const result = await kogan.updateStockAndPrice(
+            priced.map(({ link, fields }) => ({
+              product_sku: link.koganSku,
+              offer_data: buildOfferData(link, { ...fields, shipping }),
+            })),
+          );
+          if (result.error) for (const { link } of priced) failed.set(link.koganSku, result.error);
+          for (const entry of result.errors) failed.set(entry.product_sku, formatKoganErrors([entry]));
+          pendingUrls = result.pendingUrls || [];
+          taskIds = result.taskIds || [];
+        } catch (error) {
+          for (const { link } of priced) failed.set(link.koganSku, error.message);
+        }
+      }
+
+      for (const { link, fields } of batch) {
+        counters.processed += 1;
+
+        if (!priced.some((item) => item.link.id === link.id)) {
+          counters.skipped += 1;
+          continue;
+        }
+
+        const problem = failed.get(link.koganSku);
+        if (problem && isNotFoundProblem(problem)) {
+          if (await relistMissingSku(kogan, shop, link, [problem], taskIds)) {
+            counters.created += 1;
+          } else {
+            counters.failed += 1;
+          }
+          continue;
+        }
+
+        if (problem) {
+          counters.failed += 1;
+          await logSync(shop, {
+            direction: "shopify_to_kogan",
+            action: "update",
+            status: "error",
+            sku: link.koganSku,
+            productId: link.shopifyProductId,
+            title: fields?.title ?? null,
+            message: `Could not set ${label} on Kogan: ${problem}`,
+            taskId: taskIds.join(", ") || null,
+          });
+          continue;
+        }
+
+        counters.updated += 1;
+        await prisma.koganProductLink.update({
+          where: { id: link.id },
+          data: {
+            snapshot: JSON.stringify({ ...fields, shipping }),
+            syncStatus: "pending",
+            syncError: null,
+            lastTaskId: taskIds.at(-1) || link.lastTaskId,
+            pendingTaskUrl: pendingUrls.length ? JSON.stringify(pendingUrls) : null,
+            verifyAfter: nextVerifyTime(),
+            verifyAttempts: 0,
+          },
+        });
+      }
+
+      await progress(true);
+    }
+
+    const summary = `${label[0].toUpperCase()}${label.slice(1)} sent to Kogan for ${counters.updated} of ${counters.total} SKUs`;
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "update",
+      status: counters.failed > 0 ? "error" : "success",
+      message: `${summary}${counters.failed ? ` (${counters.failed} failed)` : ""}${counters.skipped ? `. ${counters.skipped} SKUs without a known price get it with their next sync` : ""}.`,
+    });
+
+    return `${summary}.`;
+  });
+}
+
+/**
+ * Shops that have never chosen a shipping option use the default (free
+ * shipping). It is sent to every product already on Kogan once, and then
+ * saved, so it is not sent again. When another job is running, this is
+ * retried on the next background run.
+ */
+export async function applyDefaultShipping(shop, settings) {
+  if (settings.koganShipping) return false;
+
+  const mode = shippingModeOf(settings);
+  const job = await startShippingJob(shop, mode);
+  if (job.type !== "shipping") return false;
+
+  await saveSettings(shop, { koganShipping: mode });
+  return true;
 }
 
 /**
@@ -2087,6 +2236,18 @@ function findUnappliedFields(link, sent, koganProduct) {
             ? `price (Kogan ${koganPrice} still includes 15% NZ GST although the stock location on Kogan is NZ, Shopify ${sent.price})`
             : `price (Kogan ${koganPrice} includes 15% NZ GST added while the stock location was not NZ, Shopify ${sent.price})`
           : `price (Kogan ${offer?.price ?? "none"}, Shopify ${sent.price})`,
+      });
+    }
+  }
+
+  // Only checked when Kogan reports the field, so a response without it
+  // never causes endless resends.
+  if (sent.shipping !== undefined && offer && "shipping" in offer) {
+    const koganShipping = toMoneyString(offer.shipping);
+    if (koganShipping !== sent.shipping) {
+      differences.push({
+        field: "shipping",
+        text: `shipping (Kogan ${koganShipping === null ? "variable" : koganShipping}, Settings ${sent.shipping === null ? "variable" : sent.shipping})`,
       });
     }
   }

@@ -6,7 +6,24 @@ import { CategoryPicker } from "../components/category-picker";
 import { authenticate } from "../shopify.server";
 import { DEFAULT_API_BASE_URL, createKoganClient } from "../kogan/kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "../kogan/categories.server";
-import { scheduleFullKoganCheck, startLocationJob } from "../kogan/sync.server";
+import { scheduleFullKoganCheck, startLocationJob, startShippingJob } from "../kogan/sync.server";
+
+/**
+ * Sends the shipping option to every product on Kogan. Returns false when
+ * another job is running, so the merchant can send it once that finishes.
+ */
+async function sendShipping(shop, mode) {
+  const job = await startShippingJob(shop, mode);
+  if (job.type !== "shipping") return false;
+  await saveSettings(shop, { koganShipping: mode });
+  return true;
+}
+
+function shippingMessage(started, mode, prefix = "") {
+  return started
+    ? `${prefix}Sending ${mode} shipping to Kogan for all products`
+    : `${prefix}Another job is running. Click "Send ${mode} shipping to all products now" once it finishes`;
+}
 
 function apiHost(apiBaseUrl) {
   try {
@@ -16,10 +33,12 @@ function apiHost(apiBaseUrl) {
   }
 }
 import {
+  SHIPPING_MODES,
   SUPPORTED_CURRENCIES,
   getSettings,
   hasEnvCredentials,
   saveSettings,
+  shippingModeOf,
 } from "../kogan/store.server";
 
 const STOCK_LOCATIONS = ["AU", "NZ", "CN", "HK", "US", "UK"];
@@ -51,6 +70,7 @@ export const loader = async ({ request }) => {
     defaultCategoryPath: defaultCategoryRecord?.display || "",
     handlingDays: settings.handlingDays,
     productLocation: settings.productLocation || "",
+    koganShipping: shippingModeOf(settings),
     autoSyncEnabled: settings.autoSyncEnabled,
     createOnKogan: settings.createOnKogan,
     zeroStockOnDelete: settings.zeroStockOnDelete,
@@ -85,6 +105,7 @@ function readForm(formData, current) {
     defaultCategory: text("defaultCategory") || null,
     handlingDays: Number(text("handlingDays")),
     productLocation: text("productLocation") || null,
+    koganShipping: text("koganShipping") || shippingModeOf(current),
     autoSyncEnabled: formData.has("autoSyncEnabled"),
     createOnKogan: formData.has("createOnKogan"),
     zeroStockOnDelete: formData.has("zeroStockOnDelete"),
@@ -102,6 +123,7 @@ function validate(values) {
 
   if (!values.syncTag) errors.syncTag = "Enter the tag used to mark Kogan products.";
   if (!SUPPORTED_CURRENCIES.includes(values.currency)) errors.currency = "Choose a currency.";
+  if (!SHIPPING_MODES.includes(values.koganShipping)) errors.koganShipping = "Choose a shipping option.";
   if (!Number.isInteger(values.handlingDays) || values.handlingDays < 0 || values.handlingDays > 60) {
     errors.handlingDays = "Enter a whole number of days between 0 and 60.";
   }
@@ -163,31 +185,65 @@ export const action = async ({ request }) => {
     };
   }
 
+  if (formData.get("intent") === "apply-shipping") {
+    const mode = shippingModeOf(current);
+    const started = await sendShipping(session.shop, mode);
+    return { intent: "apply-shipping", ok: started, message: shippingMessage(started, mode) };
+  }
+
   const errors = validate(values);
   if (Object.keys(errors).length > 0) {
     return { intent: "save", ok: false, errors, message: "Please fix the highlighted fields" };
   }
 
-  await saveSettings(session.shop, values);
+  const shippingChanged = values.koganShipping !== current.koganShipping;
+  const environmentChanged = apiHost(values.apiBaseUrl) !== apiHost(current.apiBaseUrl);
+  const locationChanged = Boolean(values.productLocation) && values.productLocation !== current.productLocation;
+
+  // A new shipping option (or the default, before it was first sent) is
+  // saved once the job that sends it to Kogan has started. The stock location
+  // job sends each price with the saved shipping option, so with a location
+  // change it is saved right away.
+  await saveSettings(session.shop, {
+    ...values,
+    koganShipping: shippingChanged && !locationChanged ? current.koganShipping : values.koganShipping,
+  });
 
   // Kogan cannot move listings between its test and live environments, so
   // after a switch every product is checked and missing ones are listed again.
-  if (apiHost(values.apiBaseUrl) !== apiHost(current.apiBaseUrl)) {
+  if (environmentChanged) {
     const count = await scheduleFullKoganCheck(session.shop);
+    let note = "";
+    if (locationChanged) {
+      await startLocationJob(session.shop);
+      note = `. Sending stock location ${values.productLocation} to Kogan for all products`;
+    } else if (shippingChanged) {
+      note = `. ${shippingMessage(await sendShipping(session.shop, values.koganShipping), values.koganShipping)}`;
+    }
     return {
       intent: "save",
       ok: true,
-      message: `Settings saved. Kogan environment changed: checking ${count} SKUs and listing missing ones again`,
+      message: `Settings saved. Kogan environment changed: checking ${count} SKUs and listing missing ones again${note}`,
     };
   }
 
   // A new stock location is applied to every product already on Kogan.
-  if (values.productLocation && values.productLocation !== current.productLocation) {
+  if (locationChanged) {
     await startLocationJob(session.shop);
     return {
       intent: "save",
       ok: true,
       message: `Settings saved. Sending stock location ${values.productLocation} to Kogan for all products`,
+    };
+  }
+
+  // A new shipping option is applied to every product already on Kogan.
+  if (shippingChanged) {
+    const started = await sendShipping(session.shop, values.koganShipping);
+    return {
+      intent: "save",
+      ok: true,
+      message: shippingMessage(started, values.koganShipping, "Settings saved. "),
     };
   }
 
@@ -201,6 +257,7 @@ export default function Settings() {
   const formRef = useRef(null);
   const [currency, setCurrency] = useState(settings.currency);
   const [location, setLocation] = useState(settings.productLocation);
+  const [shipping, setShipping] = useState(settings.koganShipping);
   const [category, setCategory] = useState(settings.defaultCategory);
   const [categoryLabel, setCategoryLabel] = useState(settings.defaultCategoryPath);
   const [categoryFieldKey, setCategoryFieldKey] = useState(0);
@@ -356,6 +413,47 @@ export default function Settings() {
                   </s-button>
                 </s-stack>
               )}
+            </s-stack>
+          </s-section>
+
+          <s-section heading="Shipping on Kogan">
+            <s-stack gap="base">
+              <s-select
+                name="koganShipping"
+                label="Shipping"
+                details="Sent to Kogan for every product and kept up to date. Saving a different option updates all products already on Kogan."
+                error={errors.koganShipping}
+                onChange={(event) => setShipping(event.currentTarget.value)}
+                onInput={(event) => setShipping(event.currentTarget.value)}
+              >
+                <s-option value="free" selected={settings.koganShipping === "free" || undefined}>
+                  Free shipping (default)
+                </s-option>
+                <s-option value="variable" selected={settings.koganShipping === "variable" || undefined}>
+                  Variable shipping (Kogan shipping matrix)
+                </s-option>
+              </s-select>
+              {shipping === "free" ? (
+                <s-banner tone="info" heading="Free shipping">
+                  Shipping is sent to Kogan as 0, so customers pay only the product price. Make sure
+                  your Kogan prices cover your delivery costs.
+                </s-banner>
+              ) : (
+                <s-banner tone="info" heading="Variable shipping">
+                  Kogan works out the shipping charge from each product&apos;s weight and the
+                  customer&apos;s location, using the shipping matrix you send to Kogan (Per Kilo
+                  Charge or Weight Range template). Keep product weights in Shopify accurate, and do
+                  not mention free shipping in your product descriptions.
+                </s-banner>
+              )}
+              <s-stack direction="inline">
+                <s-button
+                  loading={busyIntent === "apply-shipping" || undefined}
+                  onClick={() => submit("apply-shipping")}
+                >
+                  Send {settings.koganShipping} shipping to all products now
+                </s-button>
+              </s-stack>
             </s-stack>
           </s-section>
 

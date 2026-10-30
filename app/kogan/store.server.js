@@ -11,6 +11,7 @@ const SETTINGS_DEFAULTS = {
   defaultCategory: null,
   handlingDays: 2,
   productLocation: null,
+  koganShipping: null,
   autoSyncEnabled: true,
   createOnKogan: true,
   zeroStockOnDelete: true,
@@ -46,6 +47,24 @@ export function hasKoganCredentials(settings) {
 
 export function hasEnvCredentials() {
   return Boolean(process.env.KOGAN_SELLER_ID && process.env.KOGAN_SELLER_TOKEN);
+}
+
+/**
+ * How shipping is charged on Kogan. Kogan's "shipping" offer field is a
+ * carton rate: "0" means free shipping, and an empty value means variable
+ * shipping, calculated by Kogan from the shipping matrix the seller gave them
+ * and each product's weight. Free shipping is the default; koganShipping is
+ * empty until the option has been saved or applied to Kogan once.
+ */
+export const SHIPPING_MODES = ["free", "variable"];
+
+export function shippingModeOf(settings) {
+  return settings.koganShipping === "variable" ? "variable" : "free";
+}
+
+/** The value sent to Kogan as offer_data.<currency>.shipping. */
+export function koganShippingValue(settings) {
+  return shippingModeOf(settings) === "free" ? "0.00" : null;
 }
 
 export function hasSyncTag(tags, syncTag) {

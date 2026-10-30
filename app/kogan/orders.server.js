@@ -9,7 +9,7 @@ import {
   getOrderState,
 } from "./shopify-orders.server";
 import { getSettings, hasKoganCredentials, logSync, saveSettings } from "./store.server";
-import { checkPendingKoganTasks, verifyKoganState } from "./sync.server";
+import { applyDefaultShipping, checkPendingKoganTasks, verifyKoganState } from "./sync.server";
 import { ensureCategories } from "./categories.server";
 
 const POLL_TICK_MS = 60 * 1000;
@@ -663,6 +663,9 @@ async function pollDueShops() {
     );
     await ensureCategories(settings).catch((error) =>
       console.error(`Kogan category check failed for ${shop}:`, error.message),
+    );
+    await applyDefaultShipping(shop, settings).catch((error) =>
+      console.error(`Kogan default shipping failed for ${shop}:`, error.message),
     );
 
     if (!settings.orderSyncEnabled) continue;
