@@ -57,6 +57,8 @@ const activeJobs = new Set();
 const pushTimers = new Map();
 const pushChains = new Map();
 const statusApiForbidden = new Set();
+const activePushes = new Map();
+const imageWaits = new Map();
 
 // ---------------------------------------------------------------------------
 // Jobs
@@ -404,6 +406,15 @@ async function importUnit(
         message: "A Shopify product with this SKU already exists",
       });
     } catch (error) {
+      await logSync(shop, {
+        direction: "kogan_to_shopify",
+        action: updateExisting ? "update" : "import",
+        status: "error",
+        sku: item.sku,
+        productId: match.productId,
+        title: item.mapped.title,
+        message: error.message,
+      });
       results.set(item.sku, { status: "failed", productId: null, message: error.message });
     }
   }
@@ -940,12 +951,35 @@ async function removeDeletedVariants(kogan, shop, settings, product, currentSkus
   }
 }
 
+function pushKey(shop, productId) {
+  return `${shop}|${productId}`;
+}
+
+/** True while a push of this product is running or about to start. */
+function isPushBusy(shop, productId) {
+  const key = pushKey(shop, productId);
+  return activePushes.has(key) || pushTimers.has(key);
+}
+
 /**
  * Pushes the current state of a Shopify product to Kogan. Only fields that
  * changed since the last successful sync are sent. Every variant is its own
  * Kogan product (one per SKU), linked together as a Kogan variant group.
  */
-export async function pushProductToKogan(admin, shop, productId, { reason = "webhook", product: given } = {}) {
+export async function pushProductToKogan(admin, shop, productId, options = {}) {
+  const key = pushKey(shop, productId);
+  activePushes.set(key, (activePushes.get(key) || 0) + 1);
+
+  try {
+    return await runPush(admin, shop, productId, options);
+  } finally {
+    const remaining = activePushes.get(key) - 1;
+    if (remaining > 0) activePushes.set(key, remaining);
+    else activePushes.delete(key);
+  }
+}
+
+async function runPush(admin, shop, productId, { reason = "webhook", product: given } = {}) {
   const result = emptyResult();
   const settings = await getSettings(shop);
 
@@ -1048,10 +1082,11 @@ export async function pushProductToKogan(admin, shop, productId, { reason = "web
 
       if (link && link.shopifyProductId !== product.id) {
         // The SKU was moved to another Shopify product; follow it.
-        link = await prisma.koganProductLink.update({
+        const moved = await prisma.koganProductLink.updateMany({
           where: { id: link.id },
           data: { shopifyProductId: product.id, shopifyVariantId: snapshot.variantId },
         });
+        link = moved.count > 0 ? { ...link, shopifyProductId: product.id, shopifyVariantId: snapshot.variantId } : undefined;
       }
 
       if (!link) {
@@ -1060,7 +1095,7 @@ export async function pushProductToKogan(admin, shop, productId, { reason = "web
           link = adopted;
         } else if (settings.createOnKogan || relisting) {
           const created = await createOnKogan(kogan, shop, settings, product, snapshot);
-          result[created ? "created" : "failed"] += 1;
+          result[createOutcome(created)] += 1;
           continue;
         } else {
           result.skipped += 1;
@@ -1088,8 +1123,11 @@ async function adoptExistingKoganProduct(kogan, shop, settings, product, snapsho
 
   // The previous snapshot is unknown, so it is left empty and every field is
   // treated as changed: Shopify becomes the source of truth for this product.
-  return prisma.koganProductLink.create({
-    data: {
+  // upsert: a parallel sync of the same product may have created the link.
+  return prisma.koganProductLink.upsert({
+    where: { shop_koganSku: { shop, koganSku: snapshot.sku } },
+    update: {},
+    create: {
       shop,
       koganSku: snapshot.sku,
       shopifyProductId: product.id,
@@ -1373,7 +1411,12 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
     return "failed";
   }
 
-  await markSynced(shop, link, snapshot, next, pendingUrls, taskIds);
+  if (!(await markSynced(shop, link, snapshot, next, pendingUrls, taskIds))) {
+    // Something else removed the link while Kogan was answering. The product
+    // is checked again, so it is linked again if it should still be on Kogan.
+    schedulePush(shop, product.id, "webhook");
+    return "skipped";
+  }
 
   const labels = changed.map((field) => (field === "variantGroup" ? "variants" : field));
   const notes = [];
@@ -1398,6 +1441,8 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
 }
 
 const RELIST_NOTE = "with a new listing (Product Create / POST)";
+const WAITING_FOR_IMAGES = "waiting-for-images";
+const IMAGE_WAIT_MS = 5 * 60 * 1000;
 const MAX_RELISTS_PER_DAY = 2;
 
 function missingSkuMessage(sku) {
@@ -1427,6 +1472,10 @@ async function relistLimitReached(shop, sku) {
  * pushed again, which creates it with Product Create (POST).
  */
 async function relistMissingSku(kogan, shop, link, problems, taskIds = []) {
+  // A push of this product is running or queued. Its own answer from Kogan
+  // decides; a check based on older information must not remove the link.
+  if (isPushBusy(shop, link.shopifyProductId)) return null;
+
   const taskId = taskIds.filter(Boolean).join(", ") || link.lastTaskId || null;
   let title = null;
   try {
@@ -1485,6 +1534,20 @@ async function relistMissingSku(kogan, shop, link, problems, taskIds = []) {
   return true;
 }
 
+function relistCounter(relisted) {
+  if (relisted === null) return "skipped";
+  return relisted ? "created" : "failed";
+}
+
+function createOutcome(created) {
+  if (created === WAITING_FOR_IMAGES) return "skipped";
+  return created ? "created" : "failed";
+}
+
+function isAlreadyExistsProblem(problem) {
+  return /already exists/i.test(problem);
+}
+
 function isNotFoundProblem(problem) {
   return /not found|does not exist/i.test(problem) && !/category/i.test(problem);
 }
@@ -1531,8 +1594,7 @@ async function handleMissingOnKogan(kogan, shop, product, snapshot, link, proble
       message: missingSkuMessage(snapshot.sku),
       taskId: taskIds.join(", "),
     });
-    const created = await createOnKogan(kogan, shop, await getSettings(shop), product, snapshot);
-    return created ? "created" : "failed";
+    return createOutcome(await createOnKogan(kogan, shop, await getSettings(shop), product, snapshot));
   }
 
   await recordFailure(
@@ -1562,11 +1624,34 @@ function collectProblems(response, sku = null) {
   return problems;
 }
 
+/**
+ * Shopify is still processing the product's new images (readyImageUrls gave
+ * null), which is normal right after they changed. The product is tried again
+ * by itself; the images only count as missing when that takes too long.
+ */
+function waitForImages(shop, product, sku) {
+  const key = `${shop}|${sku}`;
+  const since = imageWaits.get(key);
+
+  if (since && Date.now() - since >= IMAGE_WAIT_MS) {
+    imageWaits.delete(key);
+    return false;
+  }
+  if (!since) {
+    imageWaits.set(key, Date.now());
+    setTimeout(() => schedulePush(shop, product.id, "relist"), IMAGE_WAIT_MS);
+  }
+  return true;
+}
+
 async function createOnKogan(kogan, shop, settings, product, snapshot) {
   const fields = snapshot.fields;
   const rawCategory = fields.category || settings.defaultCategory;
   const images = readyImageUrls(product, fields.images);
   const missing = [];
+
+  if (images === null && waitForImages(shop, product, snapshot.sku)) return WAITING_FOR_IMAGES;
+  if (images !== null) imageWaits.delete(`${shop}|${snapshot.sku}`);
 
   if (!rawCategory) missing.push("a Kogan category (product metafield \"Kogan category\" or the default category in Settings)");
   if (!fields.price || Number(fields.price) <= 0) missing.push("a price");
@@ -1619,6 +1704,10 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
     problems = collectProblems(response);
     taskIds.push(...(response.taskIds || []));
     grouped = false;
+  }
+
+  if (problems.length > 0 && problems.every(isAlreadyExistsProblem)) {
+    return linkExistingKoganSku(kogan, shop, settings, product, snapshot, taskIds);
   }
 
   if (problems.length > 0) {
@@ -1688,12 +1777,60 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
 }
 
 /**
+ * Kogan refused a new listing because it already has this SKU, even though
+ * its product search did not return it (a listing can take a while to show
+ * up there). The SKU is linked, and because the link has no snapshot yet, the
+ * next push sends all product data as an update.
+ */
+async function linkExistingKoganSku(kogan, shop, settings, product, snapshot, taskIds) {
+  const linkData = {
+    shopifyProductId: product.id,
+    shopifyVariantId: snapshot.variantId,
+    inventoryItemId: snapshot.inventoryItemId,
+    currency: settings.currency,
+    handlingDays: settings.handlingDays,
+    koganCategory: categoryOf(snapshot.fields),
+    snapshot: null,
+    syncStatus: "pending",
+    syncError: null,
+    pendingTaskUrl: null,
+    verifyAfter: null,
+    verifyAttempts: 0,
+    lastTaskId: taskIds.at(-1) || null,
+    koganHost: hostOf(kogan),
+    lastDirection: "shopify_to_kogan",
+  };
+
+  await prisma.koganProductLink.upsert({
+    where: { shop_koganSku: { shop, koganSku: snapshot.sku } },
+    create: { shop, koganSku: snapshot.sku, ...linkData },
+    update: linkData,
+  });
+  await forgetRetiredSkus(shop, [snapshot.sku]);
+
+  await logSync(shop, {
+    direction: "shopify_to_kogan",
+    action: "update",
+    status: "success",
+    sku: snapshot.sku,
+    productId: product.id,
+    title: snapshot.fields.title,
+    message: "Kogan already has this SKU, so the app linked it instead of creating it again and is sending the product data as an update.",
+    taskId: taskIds.join(", "),
+  });
+
+  schedulePush(shop, product.id, "webhook");
+  return true;
+}
+
+/**
  * Records a write that Kogan accepted. The product stays "pending" (shown as
  * "Awaiting Kogan") until the app has read it back from Kogan and confirmed
  * that every value was applied.
  */
 async function markSynced(shop, link, snapshot, fields, pendingUrls = [], taskIds = []) {
-  await prisma.koganProductLink.update({
+  // updateMany does not throw when the link was removed in the meantime.
+  const { count } = await prisma.koganProductLink.updateMany({
     where: { id: link.id },
     data: {
       shopifyVariantId: snapshot.variantId,
@@ -1710,6 +1847,7 @@ async function markSynced(shop, link, snapshot, fields, pendingUrls = [], taskId
       lastDirection: "shopify_to_kogan",
     },
   });
+  return count > 0;
 }
 
 /**
@@ -1908,11 +2046,8 @@ export function startLocationJob(shop) {
         counters.processed += 1;
 
         if (failed.has(link.koganSku) && isNotFoundProblem(failed.get(link.koganSku))) {
-          if (await relistMissingSku(kogan, shop, link, [failed.get(link.koganSku)], taskIds)) {
-            counters.created += 1;
-          } else {
-            counters.failed += 1;
-          }
+          const relisted = await relistMissingSku(kogan, shop, link, [failed.get(link.koganSku)], taskIds);
+          counters[relistCounter(relisted)] += 1;
           continue;
         }
 
@@ -2024,11 +2159,8 @@ export function startShippingJob(shop, mode = null) {
 
         const problem = failed.get(link.koganSku);
         if (problem && isNotFoundProblem(problem)) {
-          if (await relistMissingSku(kogan, shop, link, [problem], taskIds)) {
-            counters.created += 1;
-          } else {
-            counters.failed += 1;
-          }
+          const relisted = await relistMissingSku(kogan, shop, link, [problem], taskIds);
+          counters[relistCounter(relisted)] += 1;
           continue;
         }
 

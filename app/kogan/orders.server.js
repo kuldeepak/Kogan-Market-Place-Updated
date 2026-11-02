@@ -452,7 +452,14 @@ export async function syncKoganOrders(shop) {
 
     await saveSettings(shop, { lastOrderSyncAt: new Date(), lastOrderSyncError: null });
     return summary;
-  } catch (error) {
+  } catch (thrown) {
+    // Shopify's library can throw a Response, for example when a store no
+    // longer has a valid connection to the app.
+    const error =
+      thrown instanceof Error
+        ? thrown
+        : new Error(thrown?.status ? `Shopify answered with status ${thrown.status}` : String(thrown));
+
     if (settings.lastOrderSyncError !== error.message) {
       await logSync(shop, {
         direction: "kogan_to_shopify",
