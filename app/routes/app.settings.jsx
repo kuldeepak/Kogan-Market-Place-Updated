@@ -6,7 +6,12 @@ import { CategoryPicker } from "../components/category-picker";
 import { authenticate } from "../shopify.server";
 import { DEFAULT_API_BASE_URL, createKoganClient } from "../kogan/kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "../kogan/categories.server";
-import { scheduleFullKoganCheck, startLocationJob, startShippingJob } from "../kogan/sync.server";
+import {
+  scheduleFullKoganCheck,
+  startCatalogueCheckJob,
+  startLocationJob,
+  startShippingJob,
+} from "../kogan/sync.server";
 
 /**
  * Sends the shipping option to every product on Kogan. Returns false when
@@ -170,6 +175,18 @@ export const action = async ({ request }) => {
       intent: "check-all",
       ok: true,
       message: `Checking ${count} SKUs on Kogan. Missing ones are listed again automatically`,
+    };
+  }
+
+  if (formData.get("intent") === "check-catalogue") {
+    const job = await startCatalogueCheckJob(session.shop);
+    const started = job.type === "catalogue";
+    return {
+      intent: "check-catalogue",
+      ok: started,
+      message: started
+        ? "Checking brands and titles of all Kogan listings. Progress is shown on the Dashboard"
+        : "Another job is running. Try again once it finishes",
     };
   }
 
@@ -338,11 +355,20 @@ export default function Settings() {
                 >
                   Check all products on Kogan
                 </s-button>
+                <s-button
+                  loading={busyIntent === "check-catalogue" || undefined}
+                  onClick={() => submit("check-catalogue")}
+                >
+                  Check brands and titles on Kogan
+                </s-button>
               </s-stack>
               <s-text color="subdued">
                 Kogan keeps its test and live environments separate. After switching the API
                 URL, every product is checked on the new environment and products Kogan does
-                not have yet are created there automatically.
+                not have yet are created there automatically. “Check brands and titles on
+                Kogan” reads every Kogan listing, sends the Shopify brand (Vendor) and title
+                again wherever Kogan shows something different, and lists Kogan listings that
+                are not linked to a Shopify product in Activity.
               </s-text>
             </s-stack>
           </s-section>

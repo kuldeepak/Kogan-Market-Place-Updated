@@ -140,14 +140,16 @@ export function JobBanner({ job }) {
         ? "Stock location update"
         : job.type === "shipping"
           ? "Shipping update"
-          : "Push to Kogan";
+          : job.type === "catalogue"
+            ? "Brand and title check"
+            : "Push to Kogan";
 
   if (job.status === "running") {
     // Kogan does not report a catalogue size, so imports show an open-ended
     // progress bar with running totals instead of a percentage.
     const percent = !isImport && job.total > 0 ? Math.round((job.processed / job.total) * 100) : undefined;
     const counts = isRefresh
-      ? `${job.processed} Kogan products checked · ${job.updated} updated in Shopify · ${job.skipped} not in Shopify · ${job.failed} failed`
+      ? `${job.processed} Kogan products checked · ${job.updated} updated in Shopify · ${job.skipped} skipped · ${job.failed} failed`
       : isImport
       ? `${job.processed} products checked · ${job.created} imported · ${job.skipped} already existed · ${job.failed} failed`
       : `${job.processed} of ${job.total} products processed · ${job.created} created · ${job.updated} updated · ${job.failed} failed`;

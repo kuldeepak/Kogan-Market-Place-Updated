@@ -365,7 +365,7 @@ async function importUnit(
   locationId,
   unit,
   existing,
-  { updateExisting = false, onlyExisting = false } = {},
+  { updateExisting = false, onlyExisting = false, keepUnconfirmed = false } = {},
   results,
 ) {
   const fresh = [];
@@ -378,6 +378,15 @@ async function importUnit(
     }
 
     try {
+      if (updateExisting && keepUnconfirmed && (await hasUnconfirmedShopifyChanges(shop, item.sku))) {
+        results.set(item.sku, {
+          status: "kept",
+          productId: match.productId,
+          message: "Kept as it is: changes made in Shopify are not confirmed on Kogan yet",
+        });
+        continue;
+      }
+
       if (updateExisting) {
         await refreshExistingProduct(admin, shop, settings, locationId, match.productId, item.sku, item.mapped);
         await logSync(shop, {
@@ -479,6 +488,19 @@ async function importUnit(
 }
 
 /**
+ * True when the SKU has Shopify changes that Kogan has not confirmed yet
+ * (still awaiting Kogan, or not applied). Copying Kogan's older values into
+ * Shopify would undo them, for example a corrected brand or title.
+ */
+async function hasUnconfirmedShopifyChanges(shop, sku) {
+  const link = await prisma.koganProductLink.findUnique({
+    where: { shop_koganSku: { shop, koganSku: sku } },
+    select: { syncStatus: true, lastDirection: true },
+  });
+  return Boolean(link) && link.lastDirection === "shopify_to_kogan" && link.syncStatus !== "synced";
+}
+
+/**
  * Imports a batch of Kogan products. Products whose SKU already exists in
  * Shopify are not duplicated: they are reported as "exists" and linked so
  * they keep syncing. With `updateExisting`, existing products are refreshed
@@ -494,7 +516,7 @@ export async function importKoganProducts(
   settings,
   locationId,
   koganProducts,
-  { updateExisting = false, onlyExisting = false, skipRetired = false } = {},
+  { updateExisting = false, onlyExisting = false, skipRetired = false, keepUnconfirmed = false } = {},
 ) {
   const results = new Map();
   const units = [];
@@ -541,7 +563,7 @@ export async function importKoganProducts(
   }
 
   await mapWithConcurrency(units, IMPORT_CONCURRENCY, (unit) =>
-    importUnit(admin, shop, settings, locationId, unit, existing, { updateExisting, onlyExisting }, results),
+    importUnit(admin, shop, settings, locationId, unit, existing, { updateExisting, onlyExisting, keepUnconfirmed }, results),
   );
 
   return koganProducts.map((koganProduct) => {
@@ -623,6 +645,7 @@ export function startImportJob(shop) {
  */
 export function startRefreshJob(shop) {
   return startJob(shop, "refresh", async (counters, progress) => {
+    let kept = 0;
     const { admin } = await unauthenticated.admin(shop);
     const settings = await getSettings(shop);
     const kogan = createKoganClient(settings);
@@ -635,19 +658,22 @@ export function startRefreshJob(shop) {
       const results = await importKoganProducts(admin, shop, settings, locationId, page, {
         updateExisting: true,
         onlyExisting: true,
+        keepUnconfirmed: true,
       });
 
       for (const result of results) {
         if (result.status === "updated") counters.updated += 1;
         else if (result.status === "failed") counters.failed += 1;
         else counters.skipped += 1;
+        if (result.status === "kept") kept += 1;
         counters.processed += 1;
       }
 
       await progress(true);
     }
 
-    return `Updated ${counters.updated} Shopify products from Kogan. ${counters.skipped} Kogan products are not in Shopify and were left alone.`;
+    const keptNote = kept > 0 ? ` ${kept} were kept as they are because their Shopify changes are not confirmed on Kogan yet.` : "";
+    return `Updated ${counters.updated} Shopify products from Kogan. ${counters.skipped - kept} Kogan products are not in Shopify and were left alone.${keptNote}`;
   });
 }
 
@@ -2227,6 +2253,132 @@ export async function applyDefaultShipping(shop, settings) {
 }
 
 /**
+ * Reads every listing on Kogan and compares its brand and title with what the
+ * app last sent from Shopify. Differences are sent to Kogan again (with the
+ * current Shopify values). Listings that no Shopify product is linked to
+ * cannot be updated by the app; each one is listed in Activity with the
+ * reason, so they can be fixed or removed.
+ */
+export function startCatalogueCheckJob(shop) {
+  return startJob(shop, "catalogue", async (counters, progress) => {
+    const { admin } = await unauthenticated.admin(shop);
+    const settings = await getSettings(shop);
+    const kogan = createKoganClient(settings);
+    const host = hostOf(kogan);
+    const toPush = new Set();
+    const notLinked = [];
+    let different = 0;
+
+    for await (const page of kogan.listProducts({ pageSize: 100 })) {
+      counters.total += page.length;
+      const skus = page.map((item) => item.product_sku?.trim()).filter(Boolean);
+      const links = await prisma.koganProductLink.findMany({ where: { shop, koganSku: { in: skus } } });
+      const linkBySku = new Map(links.map((link) => [link.koganSku, link]));
+
+      for (const koganProduct of page) {
+        counters.processed += 1;
+        const sku = koganProduct.product_sku?.trim();
+        if (!sku) continue;
+
+        const link = linkBySku.get(sku);
+        if (!link || (link.koganHost && link.koganHost !== host)) {
+          notLinked.push(koganProduct);
+          continue;
+        }
+
+        let sent = null;
+        try {
+          sent = link.snapshot ? JSON.parse(link.snapshot) : null;
+        } catch {
+          sent = null;
+        }
+
+        const fields = [];
+        if (sent) {
+          if (typeof sent.brand !== "string" || !sameBrand(koganProduct.brand, sent.brand)) fields.push("brand");
+          if (typeof sent.title !== "string" || String(koganProduct.product_title || "").trim() !== sent.title.slice(0, 255).trim()) {
+            fields.push("title");
+          }
+        }
+
+        if (sent && fields.length === 0) {
+          counters.skipped += 1;
+          continue;
+        }
+
+        if (sent) {
+          // Mark the fields as unsent so the push includes them again.
+          const marked = { ...sent };
+          for (const field of fields) marked[field] = { resend: true };
+          await prisma.koganProductLink.updateMany({
+            where: { id: link.id },
+            data: { snapshot: JSON.stringify(marked), verifyAttempts: 0 },
+          });
+        }
+        different += 1;
+        toPush.add(link.shopifyProductId);
+      }
+
+      await progress();
+    }
+    await progress(true);
+
+    if (notLinked.length > 0) {
+      const inShopify = await findVariantsBySkus(admin, notLinked.map((item) => item.product_sku.trim()));
+      const retired = await getRetiredSkus(shop, notLinked.map((item) => item.product_sku.trim()));
+
+      for (const koganProduct of notLinked) {
+        const sku = koganProduct.product_sku.trim();
+        const match = inShopify.get(sku);
+        const shown = `Kogan shows brand "${koganProduct.brand || "not set"}" and title "${koganProduct.product_title || ""}".`;
+        const reason = match
+          ? `A Shopify product has this SKU but is not linked to the app. Add the "${settings.syncTag}" tag to it, and the app keeps its brand and title in sync.`
+          : retired.has(sku)
+            ? "This is an old listing: the SKU was removed or changed in Shopify, so the app no longer updates it (its Kogan stock was set to 0). Ask Kogan to remove it, or correct it in the Kogan seller portal."
+            : "This SKU is not in Shopify, so the app cannot update it. Import it on the Import page to manage it from Shopify, or correct it in the Kogan seller portal.";
+
+        await logSync(shop, {
+          direction: "shopify_to_kogan",
+          action: "check",
+          status: "error",
+          sku,
+          productId: match?.productId ?? null,
+          title: koganProduct.product_title || sku,
+          message: `Not linked to a Shopify product. ${shown} ${reason}`,
+        });
+      }
+    }
+
+    for (const productId of toPush) {
+      try {
+        const outcome = await pushProductToKogan(admin, shop, productId, { reason: "manual" });
+        counters.updated += outcome.updated + outcome.created;
+        counters.failed += outcome.failed;
+      } catch (error) {
+        counters.failed += 1;
+        await logSync(shop, {
+          direction: "shopify_to_kogan",
+          action: "update",
+          status: "error",
+          productId,
+          message: error.message,
+        });
+      }
+      await progress();
+    }
+
+    const summary = `Checked ${counters.processed} Kogan listings: ${counters.skipped} match Shopify, ${different} had a different brand or title and were sent again${notLinked.length ? `, ${notLinked.length} are not linked to a Shopify product (listed in Activity)` : ""}.`;
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "check",
+      status: counters.failed > 0 || notLinked.length > 0 ? "error" : "success",
+      message: summary,
+    });
+    return summary;
+  });
+}
+
+/**
  * Schedules every linked product to be checked against Kogan on the next
  * background run. Products Kogan does not have are listed again; the rest are
  * confirmed or corrected. Used after the Kogan environment changes.
@@ -2330,6 +2482,10 @@ const VERIFY_BATCH_SIZE = 50;
 const NEW_LISTING_GRACE_MS = 60 * 60 * 1000;
 const STORE_LINK_RECHECK_MS = 6 * 60 * 60 * 1000;
 
+function sameBrand(a, b) {
+  return String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+}
+
 export function nextVerifyTime() {
   return new Date(Date.now() + VERIFY_DELAY_MS);
 }
@@ -2389,6 +2545,12 @@ function findUnappliedFields(link, sent, koganProduct) {
     if (Number(koganProduct.stock) !== expected) {
       differences.push({ field: "stock", text: `stock (Kogan ${koganProduct.stock}, Shopify ${expected})` });
     }
+  }
+
+  // Only checked when Kogan reports the field, so a response without it
+  // never causes endless resends.
+  if (typeof sent.brand === "string" && sent.brand && "brand" in koganProduct && !sameBrand(koganProduct.brand, sent.brand)) {
+    differences.push({ field: "brand", text: `brand (Kogan "${koganProduct.brand || "not set"}", Shopify "${sent.brand}")` });
   }
 
   if (sent.title && String(koganProduct.product_title || "").trim() !== sent.title.slice(0, 255).trim()) {
