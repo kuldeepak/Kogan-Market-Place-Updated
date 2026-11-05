@@ -1,4 +1,5 @@
-import { redirect, Form, useLoaderData } from "react-router";
+import { useEffect } from "react";
+import { redirect, Form, useLoaderData, useNavigate } from "react-router";
 import { login } from "../../shopify.server";
 import styles from "./styles.module.css";
 
@@ -10,11 +11,26 @@ export const loader = async ({ request }) => {
     throw redirect(`/app/?${url.searchParams.toString()}`);
   }
 
+  // Inside Shopify admin, the back arrow in the title bar opens the app root
+  // without the shop parameter. App Bridge sends its session token with that
+  // request, so the merchant is taken to the dashboard instead of the login
+  // page.
+  if (/^Bearer\s+\S+/i.test(request.headers.get("authorization") || "")) {
+    throw redirect("/app/");
+  }
+
   return { showForm: Boolean(login) };
 };
 
 export default function App() {
   const { showForm } = useLoaderData();
+  const navigate = useNavigate();
+
+  // Fallback for the same case on the client: inside Shopify admin (App
+  // Bridge is loaded), the root page is never meant to be shown.
+  useEffect(() => {
+    if (window.top !== window.self && window.shopify) navigate("/app/", { replace: true });
+  }, [navigate]);
 
   return (
     <div className={styles.index}>

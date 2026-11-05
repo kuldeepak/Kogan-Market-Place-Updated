@@ -2253,6 +2253,126 @@ export async function applyDefaultShipping(shop, settings) {
 }
 
 /**
+ * The Shopify product a Kogan listing without a link most likely belongs to:
+ * a linked SKU that differs only by a "-<number>" ending, for example
+ * "ABC-1" (old) and "ABC" (current). Returns that link or null.
+ */
+async function relatedLink(shop, sku) {
+  const base = sku.replace(/-\d+$/, "");
+  return prisma.koganProductLink.findFirst({
+    where: {
+      shop,
+      koganSku: { not: sku },
+      OR: [{ koganSku: base }, { koganSku: { startsWith: `${base}-` } }],
+    },
+    orderBy: { updatedAt: "desc" },
+  });
+}
+
+function snapshotOf(link) {
+  try {
+    return link?.snapshot ? JSON.parse(link.snapshot) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Explains, in Activity, every Kogan listing that no Shopify product is
+ * linked to. Their brand is corrected where the right one is known: the brand
+ * of the Shopify product that now uses a closely related SKU, or a brand that
+ * linked products use and that the listing title starts with (for example
+ * "Apple iPhone 13 ..."). Nothing else on those listings is changed. Returns
+ * how many brands were corrected.
+ */
+async function reportUnlinkedListings(admin, shop, settings, kogan, listings) {
+  const skus = listings.map((item) => item.product_sku.trim());
+  const inShopify = await findVariantsBySkus(admin, skus);
+  const retired = await getRetiredSkus(shop, skus);
+
+  const knownBrands = new Map();
+  for (const link of await prisma.koganProductLink.findMany({ where: { shop }, select: { snapshot: true } })) {
+    const brand = snapshotOf(link)?.brand;
+    if (typeof brand === "string" && brand.trim()) knownBrands.set(brand.trim().toLowerCase(), brand.trim());
+  }
+
+  const entries = [];
+  for (const koganProduct of listings) {
+    const sku = koganProduct.product_sku.trim();
+    const title = koganProduct.product_title || "";
+    const match = inShopify.get(sku);
+    const related = match ? null : await relatedLink(shop, sku);
+    const relatedFields = snapshotOf(related);
+
+    let brand = null;
+    if (!match) {
+      const firstWord = title.trim().split(/\s+/)[0]?.toLowerCase();
+      brand =
+        (typeof relatedFields?.brand === "string" && relatedFields.brand.trim()) ||
+        knownBrands.get(firstWord) ||
+        null;
+      if (brand && sameBrand(brand, koganProduct.brand)) brand = null;
+    }
+
+    const shown = `Kogan shows brand "${koganProduct.brand || "not set"}", title "${title}" and stock ${koganProduct.stock ?? "unknown"}.`;
+    let reason;
+    if (match) {
+      reason = `A Shopify product has exactly this SKU but is not linked to the app. Add the "${settings.syncTag}" tag to it, and the app keeps its brand and title in sync.`;
+    } else if (related) {
+      reason = `No Shopify product uses exactly this SKU any more. The Shopify product "${relatedFields?.title || related.shopifyProductId}" now uses SKU ${related.koganSku}, which is a separate Kogan listing that the app keeps up to date. Shopify's product search also shows products with a similar SKU, so check the variant's SKU field to compare. Kogan keeps old listings: ask Kogan to remove ${sku} if it is no longer needed.`;
+    } else if (retired.has(sku)) {
+      reason = "This is an old listing: the SKU was removed or changed in Shopify, so the app no longer updates it. Ask Kogan to remove it, or correct it in the Kogan seller portal.";
+    } else {
+      reason = "No Shopify product uses exactly this SKU, so the app cannot update it. Import it on the Import page to manage it from Shopify, or correct it in the Kogan seller portal.";
+    }
+
+    entries.push({ sku, title, match, brand, message: `Not linked to a Shopify product. ${shown} ${reason}` });
+  }
+
+  const fixes = entries.filter((entry) => entry.brand);
+  let response = null;
+  let sendError = null;
+  if (fixes.length > 0) {
+    try {
+      response = await kogan.updateProducts(fixes.map((entry) => ({ product_sku: entry.sku, brand: entry.brand })));
+    } catch (error) {
+      sendError = error.message;
+    }
+  }
+  const taskId = (response?.taskIds || []).join(", ") || null;
+
+  let fixed = 0;
+  for (const entry of entries) {
+    let message = entry.message;
+    let status = "error";
+
+    if (entry.brand) {
+      const problems = sendError ? [sendError] : collectProblems(response, entry.sku);
+      if (problems.length === 0) {
+        fixed += 1;
+        status = "success";
+        message = `${message} The app corrected its brand on Kogan to "${entry.brand}".`;
+      } else {
+        message = `${message} The app tried to correct its brand to "${entry.brand}", but Kogan answered: ${problems.join(" | ")}`;
+      }
+    }
+
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "check",
+      status,
+      sku: entry.sku,
+      productId: entry.match?.productId ?? null,
+      title: entry.title || entry.sku,
+      message,
+      taskId: entry.brand ? taskId : null,
+    });
+  }
+
+  return fixed;
+}
+
+/**
  * Reads every listing on Kogan and compares its brand and title with what the
  * app last sent from Shopify. Differences are sent to Kogan again (with the
  * current Shopify values). Listings that no Shopify product is linked to
@@ -2323,30 +2443,9 @@ export function startCatalogueCheckJob(shop) {
     }
     await progress(true);
 
+    let brandsFixed = 0;
     if (notLinked.length > 0) {
-      const inShopify = await findVariantsBySkus(admin, notLinked.map((item) => item.product_sku.trim()));
-      const retired = await getRetiredSkus(shop, notLinked.map((item) => item.product_sku.trim()));
-
-      for (const koganProduct of notLinked) {
-        const sku = koganProduct.product_sku.trim();
-        const match = inShopify.get(sku);
-        const shown = `Kogan shows brand "${koganProduct.brand || "not set"}" and title "${koganProduct.product_title || ""}".`;
-        const reason = match
-          ? `A Shopify product has this SKU but is not linked to the app. Add the "${settings.syncTag}" tag to it, and the app keeps its brand and title in sync.`
-          : retired.has(sku)
-            ? "This is an old listing: the SKU was removed or changed in Shopify, so the app no longer updates it (its Kogan stock was set to 0). Ask Kogan to remove it, or correct it in the Kogan seller portal."
-            : "This SKU is not in Shopify, so the app cannot update it. Import it on the Import page to manage it from Shopify, or correct it in the Kogan seller portal.";
-
-        await logSync(shop, {
-          direction: "shopify_to_kogan",
-          action: "check",
-          status: "error",
-          sku,
-          productId: match?.productId ?? null,
-          title: koganProduct.product_title || sku,
-          message: `Not linked to a Shopify product. ${shown} ${reason}`,
-        });
-      }
+      brandsFixed = await reportUnlinkedListings(admin, shop, settings, kogan, notLinked);
     }
 
     for (const productId of toPush) {
@@ -2367,7 +2466,10 @@ export function startCatalogueCheckJob(shop) {
       await progress();
     }
 
-    const summary = `Checked ${counters.processed} Kogan listings: ${counters.skipped} match Shopify, ${different} had a different brand or title and were sent again${notLinked.length ? `, ${notLinked.length} are not linked to a Shopify product (listed in Activity)` : ""}.`;
+    const unlinkedNote = notLinked.length
+      ? `, ${notLinked.length} are not linked to a Shopify product (listed in Activity${brandsFixed ? `; the brand of ${brandsFixed} of them was corrected` : ""})`
+      : "";
+    const summary = `Checked ${counters.processed} Kogan listings: ${counters.skipped} match Shopify, ${different} had a different brand or title and were sent again${unlinkedNote}.`;
     await logSync(shop, {
       direction: "shopify_to_kogan",
       action: "check",
