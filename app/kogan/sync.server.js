@@ -1,5 +1,5 @@
 import prisma from "../db.server";
-import { unauthenticated } from "../shopify.server";
+import { backgroundAdmin } from "./shopify-admin.server";
 import { createKoganClient, storeCodeForCurrency } from "./kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "./categories.server";
 import {
@@ -606,7 +606,7 @@ export async function importSkus(admin, shop, skus, options) {
  */
 export function startImportJob(shop) {
   return startJob(shop, "import", async (counters, progress) => {
-    const { admin } = await unauthenticated.admin(shop);
+    const admin = backgroundAdmin(shop);
     const settings = await getSettings(shop);
     const kogan = createKoganClient(settings);
     const locationId = await getPrimaryLocationId(admin, shop);
@@ -646,7 +646,7 @@ export function startImportJob(shop) {
 export function startRefreshJob(shop) {
   return startJob(shop, "refresh", async (counters, progress) => {
     let kept = 0;
-    const { admin } = await unauthenticated.admin(shop);
+    const admin = backgroundAdmin(shop);
     const settings = await getSettings(shop);
     const kogan = createKoganClient(settings);
     const locationId = await getPrimaryLocationId(admin, shop);
@@ -697,7 +697,7 @@ export function schedulePush(shop, productId, reason = "webhook") {
       const previous = pushChains.get(key) || Promise.resolve();
       const next = previous
         .then(async () => {
-          const { admin } = await unauthenticated.admin(shop);
+          const admin = backgroundAdmin(shop);
           await pushProductToKogan(admin, shop, productId, { reason });
         })
         .catch((error) => console.error(`Kogan push failed for ${productId}:`, error))
@@ -2381,7 +2381,7 @@ async function reportUnlinkedListings(admin, shop, settings, kogan, listings) {
  */
 export function startCatalogueCheckJob(shop) {
   return startJob(shop, "catalogue", async (counters, progress) => {
-    const { admin } = await unauthenticated.admin(shop);
+    const admin = backgroundAdmin(shop);
     const settings = await getSettings(shop);
     const kogan = createKoganClient(settings);
     const host = hostOf(kogan);
@@ -2495,7 +2495,7 @@ export async function scheduleFullKoganCheck(shop) {
 
 export function startPushAllJob(shop) {
   return startJob(shop, "push", async (counters, progress) => {
-    const { admin } = await unauthenticated.admin(shop);
+    const admin = backgroundAdmin(shop);
     const settings = await getSettings(shop);
     let unchanged = 0;
     const seen = new Set();

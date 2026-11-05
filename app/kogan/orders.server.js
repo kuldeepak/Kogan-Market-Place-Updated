@@ -1,5 +1,5 @@
 import prisma from "../db.server";
-import { unauthenticated } from "../shopify.server";
+import { backgroundAdmin, ensureBackgroundSession } from "./shopify-admin.server";
 import { createKoganClient } from "./kogan-client.server";
 import { findVariantsBySkus } from "./shopify-products.server";
 import {
@@ -431,7 +431,8 @@ export async function syncKoganOrders(shop) {
 
   try {
     const kogan = createKoganClient(settings);
-    const { admin } = await unauthenticated.admin(shop);
+    await ensureBackgroundSession(shop);
+    const admin = backgroundAdmin(shop);
     const openOrders = await kogan.getOrders("ReleasedForShipment");
 
     const rows = await prisma.koganOrder.findMany({
