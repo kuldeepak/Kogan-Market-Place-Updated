@@ -3,10 +3,13 @@ import { backgroundAdmin, ensureBackgroundSession } from "./shopify-admin.server
 import { createKoganClient } from "./kogan-client.server";
 import { findVariantsBySkus } from "./shopify-products.server";
 import {
+  canWriteCustomers,
   cancelShopifyOrder,
   createOrderFromKogan,
   fulfillOrderItems,
+  getOrderFulfillments,
   getOrderState,
+  setOrderCustomer,
 } from "./shopify-orders.server";
 import { getSettings, hasKoganCredentials, logSync, saveSettings } from "./store.server";
 import { applyDefaultShipping, checkPendingKoganTasks, verifyKoganState } from "./sync.server";
@@ -44,6 +47,49 @@ function orderStatus(items) {
 function customerName(order) {
   const address = order.ShippingAddress || order.BuyerAddress || {};
   return [address.FirstName, address.LastName].filter(Boolean).join(" ") || null;
+}
+
+const CUSTOMER_PERMISSION_NOTE =
+  'The order has no customer because the app does not have the "write customers" permission yet. Approve the updated app permissions in Shopify, and the customer is added automatically.';
+
+// Carriers recognised from the tracking link when Shopify has no carrier name.
+const CARRIERS_BY_HOST = [
+  [/nzpost|courierpost/i, "NZ Post"],
+  [/nzcouriers/i, "NZ Couriers"],
+  [/posthaste/i, "Post Haste"],
+  [/castleparcels/i, "Castle Parcels"],
+  [/aramex|fastway/i, "Aramex"],
+  [/mainfreight/i, "Mainfreight"],
+  [/dhl/i, "DHL"],
+  [/fedex|tnt/i, "FedEx"],
+  [/ups\./i, "UPS"],
+  [/auspost/i, "Australia Post"],
+  [/startrack/i, "StarTrack"],
+  [/couriersplease/i, "CouriersPlease"],
+];
+
+/**
+ * Kogan needs a carrier name for every dispatch. It is taken from the Shopify
+ * fulfillment, then from its tracking link, then from the default carrier in
+ * Settings.
+ */
+function dispatchCarrier(payload, settings) {
+  const company = String(payload.tracking_company || "").trim();
+  if (company && !/^other$/i.test(company)) return company;
+
+  const urls = [payload.tracking_url, ...(payload.tracking_urls || [])].filter(Boolean);
+  for (const url of urls) {
+    let host = "";
+    try {
+      host = new URL(url).host;
+    } catch {
+      host = String(url);
+    }
+    const known = CARRIERS_BY_HOST.find(([pattern]) => pattern.test(host));
+    if (known) return known[1];
+  }
+
+  return settings.dispatchCarrier?.trim() || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,10 +144,12 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
 
   try {
     const variantsBySku = await resolveVariants(admin, shop, items.map((item) => item.sku));
+    const withCustomer = await canWriteCustomers(admin, shop);
     const created = await createOrderFromKogan(admin, {
       order,
       variantsBySku,
       tags: [settings.syncTag, "Kogan order"],
+      withCustomer,
     });
 
     const unmatched = items.filter((item) => !variantsBySku.has(item.sku)).map((item) => item.sku);
@@ -112,10 +160,20 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
         ...rowData,
         shopifyOrderId: created.id,
         shopifyName: created.name,
+        // Empty when the customer could not be added; null leaves it to be
+        // added later, once the app has the permission.
+        customerId: created.customerId || (withCustomer && rowData.customerName ? "" : null),
         status: "imported",
         error: null,
       },
     });
+
+    const notes = [];
+    if (unmatched.length) {
+      notes.push(`No Shopify product found for SKU ${unmatched.join(", ")}, so those lines were added as custom items.`);
+    }
+    if (!withCustomer && rowData.customerName) notes.push(CUSTOMER_PERMISSION_NOTE);
+    if (created.customerProblem) notes.push(`Shopify did not accept the customer, so the order was created without one: ${created.customerProblem}`);
 
     await logSync(shop, {
       direction: "kogan_to_shopify",
@@ -123,9 +181,7 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
       status: "success",
       title: `Kogan order ${rowData.orderLabel || order.ID}`,
       sku: items.map((item) => item.sku).join(", "),
-      message: unmatched.length
-        ? `Created Shopify order ${created.name}. No Shopify product found for SKU ${unmatched.join(", ")}, so those lines were added as custom items.`
-        : `Created Shopify order ${created.name}`,
+      message: [`Created Shopify order ${created.name}.`, ...notes].join(" "),
     });
 
     return true;
@@ -450,6 +506,8 @@ export async function syncKoganOrders(shop) {
 
     await applyKoganDispatches(admin, shop, settings, kogan, summary);
     summary.cancelled = await applyKoganCancellations(admin, shop, kogan);
+    await retryFailedDispatches(admin, shop);
+    await attachMissingCustomers(admin, shop);
 
     await saveSettings(shop, { lastOrderSyncAt: new Date(), lastOrderSyncError: null });
     return summary;
@@ -500,8 +558,9 @@ export async function handleFulfillmentCreated(shop, payload) {
   if (processed.includes(fulfillmentId)) return;
 
   const items = parseJson(row.items, []);
+  const settings = await getSettings(shop);
   const trackingNumber = payload.tracking_number || payload.tracking_numbers?.[0] || undefined;
-  const carrier = payload.tracking_company || undefined;
+  const carrier = dispatchCarrier(payload, settings) || undefined;
   const shippedAt = new Date(payload.created_at || Date.now()).toISOString();
   const lines = [];
 
@@ -521,7 +580,13 @@ export async function handleFulfillmentCreated(shop, payload) {
   const title = `Kogan order ${row.orderLabel || row.koganOrderId}`;
 
   try {
-    const kogan = createKoganClient(await getSettings(shop));
+    if (!carrier) {
+      throw new Error(
+        `Kogan needs the shipping carrier for every dispatch, and none was entered in Shopify for order ${row.shopifyName || ""}. Add the carrier to the tracking details of the fulfillment in Shopify, or set a "Default carrier for Kogan dispatches" in Settings. The dispatch is then sent to Kogan automatically.`,
+      );
+    }
+
+    const kogan = createKoganClient(settings);
     const problems = await kogan.fulfillOrders([
       {
         ID: row.koganOrderId,
@@ -569,17 +634,103 @@ export async function handleFulfillmentCreated(shop, payload) {
         : "Dispatched on Kogan (no tracking number was entered in Shopify)",
     });
   } catch (error) {
+    const message = `Dispatch failed: ${error.message}`.slice(0, 2000);
     await prisma.koganOrder.update({
       where: { id: row.id },
-      data: { error: `Dispatch failed: ${error.message}`.slice(0, 2000) },
+      data: { error: message },
     });
-    await logSync(shop, {
-      direction: "shopify_to_kogan",
-      action: "dispatch",
-      status: "error",
-      title,
-      message: error.message,
-    });
+    // Failed dispatches are tried again on every order check; the same error
+    // is logged only once.
+    if (row.error !== message) {
+      await logSync(shop, {
+        direction: "shopify_to_kogan",
+        action: "dispatch",
+        status: "error",
+        title,
+        message: error.message,
+      });
+    }
+  }
+}
+
+const RETRY_BATCH_SIZE = 20;
+
+/**
+ * Sends Shopify fulfillments of Kogan orders whose dispatch failed (for
+ * example because no carrier was entered) to Kogan again, using the current
+ * fulfillment details from Shopify and the current Settings.
+ */
+async function retryFailedDispatches(admin, shop) {
+  const rows = await prisma.koganOrder.findMany({
+    where: { shop, shopifyOrderId: { not: null }, error: { startsWith: "Dispatch failed" } },
+    orderBy: { updatedAt: "asc" },
+    take: RETRY_BATCH_SIZE,
+  });
+
+  for (const row of rows) {
+    const status = orderStatus(parseJson(row.items, []));
+    if (status === "dispatched" || status === "cancelled") {
+      // Dispatched another way (for example in the Kogan seller portal).
+      await prisma.koganOrder.update({ where: { id: row.id }, data: { error: null } });
+      continue;
+    }
+
+    try {
+      for (const fulfillment of await getOrderFulfillments(admin, row.shopifyOrderId)) {
+        await handleFulfillmentCreated(shop, fulfillment);
+      }
+    } catch (error) {
+      console.error(`Retrying the Kogan dispatch of ${row.koganOrderId} failed:`, error.message);
+    }
+  }
+}
+
+/**
+ * Adds a customer (from the name on the Kogan order) to Kogan orders in
+ * Shopify that do not have one yet, for example orders created before the app
+ * had the permission. Each order is tried once.
+ */
+async function attachMissingCustomers(admin, shop) {
+  const rows = await prisma.koganOrder.findMany({
+    where: {
+      shop,
+      shopifyOrderId: { not: null },
+      customerId: null,
+      customerName: { not: null },
+      status: { not: "cancelled" },
+      orderDate: { gte: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000) },
+    },
+    orderBy: { orderDate: "desc" },
+    take: RETRY_BATCH_SIZE,
+  });
+  if (rows.length === 0 || !(await canWriteCustomers(admin, shop))) return;
+
+  for (const row of rows) {
+    const [firstName, ...rest] = row.customerName.trim().split(/\s+/);
+    const title = `Kogan order ${row.orderLabel || row.koganOrderId}`;
+    try {
+      const customerId = await setOrderCustomer(admin, row.shopifyOrderId, {
+        firstName,
+        lastName: rest.join(" ") || undefined,
+      });
+      await prisma.koganOrder.update({ where: { id: row.id }, data: { customerId } });
+      await logSync(shop, {
+        direction: "kogan_to_shopify",
+        action: "order",
+        status: "success",
+        title,
+        message: `Customer ${row.customerName} was added to Shopify order ${row.shopifyName || ""}.`,
+      });
+    } catch (error) {
+      await prisma.koganOrder.update({ where: { id: row.id }, data: { customerId: "" } });
+      await logSync(shop, {
+        direction: "kogan_to_shopify",
+        action: "order",
+        status: "error",
+        title,
+        message: `Could not add customer ${row.customerName} to Shopify order ${row.shopifyName || ""}: ${error.message}`,
+      });
+    }
   }
 }
 

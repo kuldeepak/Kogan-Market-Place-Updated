@@ -19,6 +19,7 @@ const SETTINGS_DEFAULTS = {
   autoGenerateSkus: true,
   importDispatchedOrders: true,
   dispatchedOrdersFrom: null,
+  dispatchCarrier: null,
 };
 
 export async function getSettings(shop) {

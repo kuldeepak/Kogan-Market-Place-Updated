@@ -44,6 +44,7 @@ model KoganSettings {
   handlingDays         Int      @default(2)
   productLocation      String?
   koganShipping        String?
+  dispatchCarrier      String?
   autoSyncEnabled      Boolean  @default(true)
   createOnKogan        Boolean  @default(true)
   zeroStockOnDelete    Boolean  @default(true)
@@ -151,6 +152,7 @@ model KoganOrder {
   currency       String
   totalPrice     String
   customerName   String?
+  customerId     String?
   items          String
   fulfillmentIds String    @default("[]")
   orderDate      DateTime

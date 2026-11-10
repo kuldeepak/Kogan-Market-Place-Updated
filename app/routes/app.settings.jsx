@@ -84,6 +84,7 @@ export const loader = async ({ request }) => {
     orderSyncEnabled: settings.orderSyncEnabled,
     orderSyncMinutes: settings.orderSyncMinutes,
     importDispatchedOrders: settings.importDispatchedOrders,
+    dispatchCarrier: settings.dispatchCarrier || "",
     dispatchedOrdersFrom: settings.dispatchedOrdersFrom
       ? new Date(settings.dispatchedOrdersFrom).toISOString().slice(0, 10)
       : "",
@@ -119,6 +120,7 @@ function readForm(formData, current) {
     orderSyncEnabled: formData.has("orderSyncEnabled"),
     orderSyncMinutes: Number(text("orderSyncMinutes")),
     importDispatchedOrders: formData.has("importDispatchedOrders"),
+    dispatchCarrier: text("dispatchCarrier") || null,
     dispatchedOrdersFrom: parseDate(text("dispatchedOrdersFrom")),
   };
 }
@@ -146,6 +148,9 @@ function validate(values) {
     } catch {
       errors.apiBaseUrl = "Enter a valid URL.";
     }
+  }
+  if (values.dispatchCarrier && values.dispatchCarrier.length > 100) {
+    errors.dispatchCarrier = "Enter at most 100 characters.";
   }
   if (values.defaultCategory && values.defaultCategory.length > 255) {
     errors.defaultCategory = "The category is too long.";
@@ -570,6 +575,14 @@ export default function Settings() {
                 max={1440}
                 step={1}
                 error={errors.orderSyncMinutes}
+              />
+              <s-text-field
+                name="dispatchCarrier"
+                label="Default carrier for Kogan dispatches"
+                value={settings.dispatchCarrier}
+                placeholder="e.g. NZ Post"
+                details="Kogan needs a carrier name for every dispatch. It is taken from the fulfillment in Shopify (or its tracking link); this name is used when neither has one."
+                error={errors.dispatchCarrier}
               />
               <s-switch
                 value="on"

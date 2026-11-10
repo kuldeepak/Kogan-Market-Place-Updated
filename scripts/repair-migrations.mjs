@@ -32,6 +32,13 @@ const MIGRATIONS = [
     name: "20261030090000_kogan_shipping",
     columns: [["KoganSettings", "koganShipping"]],
   },
+  {
+    name: "20261110090000_kogan_order_customer",
+    columns: [
+      ["KoganSettings", "dispatchCarrier"],
+      ["KoganOrder", "customerId"],
+    ],
+  },
 ];
 
 const DATABASE_FILE = path.resolve("prisma", "dev.sqlite");
