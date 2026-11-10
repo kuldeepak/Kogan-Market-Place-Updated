@@ -29,40 +29,71 @@ function toMailingAddress(address) {
 }
 
 /**
- * The Shopify customer for a Kogan order. Kogan does not share the buyer's
- * email address, so the customer is created from the name (and address) on
- * the order. A phone number is not used: Shopify allows each phone number on
- * only one customer.
+ * The buyer's name on a Kogan order, or null when there is none.
  */
-function toCustomer(order) {
+function customerNames(order) {
   const address = order.ShippingAddress || order.BuyerAddress || {};
   const firstName = address.FirstName?.trim() || undefined;
   const lastName = address.LastName?.trim() || undefined;
-  if (!firstName && !lastName) return undefined;
+  return firstName || lastName ? { firstName, lastName } : null;
+}
 
-  const mailing = toMailingAddress(address);
-  const customerAddress = mailing
-    ? {
-        firstName: mailing.firstName,
-        lastName: mailing.lastName,
-        company: mailing.company,
-        address1: mailing.address1,
-        address2: mailing.address2,
-        city: mailing.city,
-        province: mailing.provinceCode,
-        country: mailing.countryCode,
-        zip: mailing.zip,
+/** The first message Shopify gave, without the raw request details. */
+function shortMessage(error) {
+  return error?.body?.errors?.[0]?.message || error?.message || String(error);
+}
+
+/**
+ * Creates a Shopify customer from a name. Kogan does not share the buyer's
+ * email address, and Shopify can only create a customer together with an
+ * order when an email is given, so the customer is created on its own first.
+ * A phone number is not used: Shopify allows each number on one customer only.
+ * Returns the customer ID.
+ */
+export async function createCustomer(admin, { firstName, lastName }) {
+  const created = await shopifyGraphql(
+    admin,
+    `#graphql
+      mutation KoganCustomerCreate($input: CustomerInput!) {
+        customerCreate(input: $input) {
+          customer {
+            id
+          }
+          userErrors {
+            field
+            message
+          }
+        }
       }
-    : undefined;
+    `,
+    { input: { firstName, lastName, tags: ["Kogan"] } },
+  );
+  const errors = created.customerCreate.userErrors;
+  if (errors.length > 0 || !created.customerCreate.customer) {
+    throw new Error(`Shopify could not create the customer: ${errors.map((error) => error.message).join("; ")}`);
+  }
+  return created.customerCreate.customer.id;
+}
 
-  return {
-    toUpsert: {
-      firstName,
-      lastName,
-      tags: ["Kogan"],
-      ...(customerAddress ? { addresses: [customerAddress] } : {}),
-    },
-  };
+async function assignCustomer(admin, orderId, customerId) {
+  const set = await shopifyGraphql(
+    admin,
+    `#graphql
+      mutation KoganOrderCustomerSet($orderId: ID!, $customerId: ID!) {
+        orderCustomerSet(orderId: $orderId, customerId: $customerId) {
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    { orderId, customerId },
+  );
+  const errors = set.orderCustomerSet.userErrors;
+  if (errors.length > 0) {
+    throw new Error(`Shopify could not add the customer to the order: ${errors.map((error) => error.message).join("; ")}`);
+  }
 }
 
 const scopeCache = new Map();
@@ -180,8 +211,17 @@ export async function createOrderFromKogan(admin, { order, variantsBySku, tags, 
     ],
   };
 
-  const customer = withCustomer ? toCustomer(order) : undefined;
-  if (customer) input.customer = customer;
+  let customerProblem = null;
+  let customerId = null;
+  const names = withCustomer ? customerNames(order) : null;
+  if (names) {
+    try {
+      customerId = await createCustomer(admin, names);
+      input.customer = { toAssociate: { id: customerId } };
+    } catch (error) {
+      customerProblem = shortMessage(error);
+    }
+  }
 
   const mutation = `#graphql
     mutation CreateKoganOrder($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
@@ -206,7 +246,6 @@ export async function createOrderFromKogan(admin, { order, variantsBySku, tags, 
     sendFulfillmentReceipt: false,
   };
 
-  let customerProblem = null;
   const send = async (orderInput) => {
     try {
       return await shopifyGraphql(admin, mutation, { order: orderInput, options });
@@ -219,7 +258,7 @@ export async function createOrderFromKogan(admin, { order, variantsBySku, tags, 
       // Rejected before anything was created (no order in the answer) because
       // of the customer: the order is created without one.
       if (orderInput.customer && error.body && !created && isCustomerProblem(error.message)) {
-        customerProblem = error.message;
+        customerProblem = shortMessage(error);
         return send(withoutCustomer(orderInput));
       }
       throw error;
@@ -253,7 +292,21 @@ export async function createOrderFromKogan(admin, { order, variantsBySku, tags, 
   }
 
   const created = data.orderCreate.order;
-  return { ...created, customerId: created.customer?.id || null, customerProblem };
+  let attached = created.customer?.id || null;
+
+  // The order was created without the customer: add the customer that was
+  // already created, so no second customer is made for the same buyer.
+  if (!attached && customerId) {
+    try {
+      await assignCustomer(admin, created.id, customerId);
+      attached = customerId;
+      customerProblem = null;
+    } catch (error) {
+      customerProblem = customerProblem || shortMessage(error);
+    }
+  }
+
+  return { ...created, customerId: attached, customerProblem };
 }
 
 /**
@@ -278,47 +331,8 @@ export async function setOrderCustomer(admin, orderId, { firstName, lastName }) 
   if (!current.order) throw new Error("The Shopify order no longer exists.");
   if (current.order.customer?.id) return current.order.customer.id;
 
-  const created = await shopifyGraphql(
-    admin,
-    `#graphql
-      mutation KoganCustomerCreate($input: CustomerInput!) {
-        customerCreate(input: $input) {
-          customer {
-            id
-          }
-          userErrors {
-            field
-            message
-          }
-        }
-      }
-    `,
-    { input: { firstName, lastName, tags: ["Kogan"] } },
-  );
-  const createErrors = created.customerCreate.userErrors;
-  if (createErrors.length > 0 || !created.customerCreate.customer) {
-    throw new Error(`Shopify could not create the customer: ${createErrors.map((error) => error.message).join("; ")}`);
-  }
-  const customerId = created.customerCreate.customer.id;
-
-  const set = await shopifyGraphql(
-    admin,
-    `#graphql
-      mutation KoganOrderCustomerSet($orderId: ID!, $customerId: ID!) {
-        orderCustomerSet(orderId: $orderId, customerId: $customerId) {
-          userErrors {
-            field
-            message
-          }
-        }
-      }
-    `,
-    { orderId, customerId },
-  );
-  const setErrors = set.orderCustomerSet.userErrors;
-  if (setErrors.length > 0) {
-    throw new Error(`Shopify could not add the customer to the order: ${setErrors.map((error) => error.message).join("; ")}`);
-  }
+  const customerId = await createCustomer(admin, { firstName, lastName });
+  await assignCustomer(admin, orderId, customerId);
   return customerId;
 }
 

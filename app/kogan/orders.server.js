@@ -160,9 +160,8 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
         ...rowData,
         shopifyOrderId: created.id,
         shopifyName: created.name,
-        // Empty when the customer could not be added; null leaves it to be
-        // added later, once the app has the permission.
-        customerId: created.customerId || (withCustomer && rowData.customerName ? "" : null),
+        // null: the customer is added later by attachMissingCustomers.
+        customerId: created.customerId || null,
         status: "imported",
         error: null,
       },
@@ -173,7 +172,9 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
       notes.push(`No Shopify product found for SKU ${unmatched.join(", ")}, so those lines were added as custom items.`);
     }
     if (!withCustomer && rowData.customerName) notes.push(CUSTOMER_PERMISSION_NOTE);
-    if (created.customerProblem) notes.push(`Shopify did not accept the customer, so the order was created without one: ${created.customerProblem}`);
+    if (created.customerProblem) {
+      notes.push(`The customer could not be added yet (${created.customerProblem}); the app tries once more automatically.`);
+    }
 
     await logSync(shop, {
       direction: "kogan_to_shopify",
@@ -688,14 +689,16 @@ async function retryFailedDispatches(admin, shop) {
 /**
  * Adds a customer (from the name on the Kogan order) to Kogan orders in
  * Shopify that do not have one yet, for example orders created before the app
- * had the permission. Each order is tried once.
+ * had the permission. An order whose customer cannot be added is marked
+ * "failed" and not tried again; "" marks orders from an earlier version that
+ * gave up too early, so they are tried once more.
  */
 async function attachMissingCustomers(admin, shop) {
   const rows = await prisma.koganOrder.findMany({
     where: {
       shop,
       shopifyOrderId: { not: null },
-      customerId: null,
+      OR: [{ customerId: null }, { customerId: "" }],
       customerName: { not: null },
       status: { not: "cancelled" },
       orderDate: { gte: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000) },
@@ -722,7 +725,7 @@ async function attachMissingCustomers(admin, shop) {
         message: `Customer ${row.customerName} was added to Shopify order ${row.shopifyName || ""}.`,
       });
     } catch (error) {
-      await prisma.koganOrder.update({ where: { id: row.id }, data: { customerId: "" } });
+      await prisma.koganOrder.update({ where: { id: row.id }, data: { customerId: "failed" } });
       await logSync(shop, {
         direction: "kogan_to_shopify",
         action: "order",
