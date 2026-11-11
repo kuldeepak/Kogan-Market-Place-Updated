@@ -21,6 +21,8 @@ const SETTINGS_DEFAULTS = {
   dispatchedOrdersFrom: null,
   dispatchCarrier: null,
   koganOrderLocation: null,
+  koganFirstDiscount: null,
+  koganOrderMethod: null,
 };
 
 export async function getSettings(shop) {
@@ -67,6 +69,53 @@ export function shippingModeOf(settings) {
 /** The value sent to Kogan as offer_data.<currency>.shipping. */
 export function koganShippingValue(settings) {
   return shippingModeOf(settings) === "free" ? "0.00" : null;
+}
+
+/**
+ * Kogan FIRST (Mighty Ape Primate) pricing managed from Settings. Kogan takes
+ * a per-SKU "kogan_first_price" in each offer. Kogan's rules: a Kogan FIRST
+ * discount must be at least $2 or 3% of the normal price, whichever is
+ * greater, and when a store-wide discount is also set on Kogan's side, the
+ * larger discount is shown. An empty setting means the app does not manage
+ * Kogan FIRST prices at all (nothing is sent).
+ */
+export const KOGAN_FIRST_MIN_PERCENT = 3;
+export const KOGAN_FIRST_MAX_PERCENT = 90;
+const KOGAN_FIRST_MIN_AMOUNT = 2;
+
+/** The saved Kogan FIRST discount as a normalised percentage ("5", "7.5"), or null. */
+export function koganFirstPercent(settings) {
+  const raw = settings?.koganFirstDiscount;
+  if (raw === null || raw === undefined || String(raw).trim() === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < KOGAN_FIRST_MIN_PERCENT || value > KOGAN_FIRST_MAX_PERCENT) return null;
+  return String(Math.round(value * 100) / 100);
+}
+
+/**
+ * The Kogan FIRST price for a normal price and a discount percentage, rounded
+ * down to the cent so the discount never falls below Kogan's minimum. Returns
+ * null when there is no valid price or percentage.
+ */
+export function koganFirstPrice(price, percent) {
+  const base = Number(price);
+  const rate = Number(percent);
+  if (!Number.isFinite(base) || base <= 0 || !Number.isFinite(rate) || rate <= 0) return null;
+  const discount = Math.max((base * rate) / 100, KOGAN_FIRST_MIN_AMOUNT, (base * KOGAN_FIRST_MIN_PERCENT) / 100);
+  const result = Math.floor((base - discount) * 100 + 1e-6) / 100;
+  return result > 0 ? result.toFixed(2) : null;
+}
+
+/**
+ * How Kogan orders are created in Shopify. "draft" (the default) creates a
+ * draft order and completes it as paid, so Shopify gives the order the
+ * "Shipping" delivery method that shipping apps such as eShip import.
+ * "direct" uses orderCreate, which Shopify marks "Shipping not required".
+ */
+export const ORDER_METHODS = ["draft", "direct"];
+
+export function orderMethodOf(settings) {
+  return settings?.koganOrderMethod === "direct" ? "direct" : "draft";
 }
 
 export function hasSyncTag(tags, syncTag) {

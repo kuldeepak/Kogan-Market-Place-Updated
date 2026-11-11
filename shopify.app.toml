@@ -7,7 +7,7 @@ name = "Kogan/Mighty Ape"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_inventory,read_locations,write_files,write_orders,read_fulfillments,write_merchant_managed_fulfillment_orders,write_customers"
+scopes = "write_products,write_inventory,read_locations,write_files,write_orders,read_fulfillments,write_merchant_managed_fulfillment_orders,write_customers,write_draft_orders"
 
 [product.metafields.app.kogan_category]
 type = "single_line_text_field"

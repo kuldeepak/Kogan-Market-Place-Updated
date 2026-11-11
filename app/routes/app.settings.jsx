@@ -6,7 +6,7 @@ import { CategoryPicker } from "../components/category-picker";
 import { authenticate } from "../shopify.server";
 import { DEFAULT_API_BASE_URL, createKoganClient } from "../kogan/kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "../kogan/categories.server";
-import { listLocations } from "../kogan/shopify-orders.server";
+import { canWriteDraftOrders, listLocations } from "../kogan/shopify-orders.server";
 import {
   scheduleFullKoganCheck,
   startCatalogueCheckJob,
@@ -40,13 +40,36 @@ function apiHost(apiBaseUrl) {
   }
 }
 import {
+  KOGAN_FIRST_MAX_PERCENT,
+  KOGAN_FIRST_MIN_PERCENT,
+  ORDER_METHODS,
   SHIPPING_MODES,
   SUPPORTED_CURRENCIES,
   getSettings,
   hasEnvCredentials,
+  koganFirstPercent,
+  orderMethodOf,
   saveSettings,
   shippingModeOf,
 } from "../kogan/store.server";
+
+/**
+ * Sends the Kogan FIRST discount from Settings to every listing on Kogan.
+ * Returns false when another job is running.
+ */
+async function sendKoganFirst(shop) {
+  const job = await startKoganFirstJob(shop);
+  return job.type === "koganfirst";
+}
+
+function koganFirstMessage(started, percent, prefix = "") {
+  if (!started) {
+    return `${prefix}Another job is running. Click "Send Kogan FIRST prices to Kogan now" once it finishes`;
+  }
+  return percent
+    ? `${prefix}Sending Kogan FIRST prices (${percent}% off) to all Kogan listings. Progress is shown on the Dashboard`
+    : `${prefix}Removing Kogan FIRST prices set on single SKUs and resyncing all listings. Progress is shown on the Dashboard`;
+}
 
 const STOCK_LOCATIONS = ["AU", "NZ", "CN", "HK", "US", "UK"];
 const STOCK_LOCATION_NAMES = {
@@ -62,6 +85,7 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
   const settings = await getSettings(session.shop);
   const locations = await listLocations(admin).catch(() => []);
+  const draftOrdersAllowed = await canWriteDraftOrders(admin, session.shop);
   const defaultCategoryRecord = settings.defaultCategory
     ? await resolveCategoryValue(categorySourceFor(settings).source, settings.defaultCategory).catch(() => null)
     : null;
@@ -90,6 +114,10 @@ export const loader = async ({ request }) => {
     dispatchCarrier: settings.dispatchCarrier || "",
     koganOrderLocation: settings.koganOrderLocation || "",
     locations,
+    koganFirstDiscount: koganFirstPercent(settings) || "",
+    koganFirstLimits: { min: KOGAN_FIRST_MIN_PERCENT, max: KOGAN_FIRST_MAX_PERCENT },
+    koganOrderMethod: orderMethodOf(settings),
+    draftOrdersAllowed,
     dispatchedOrdersFrom: settings.dispatchedOrdersFrom
       ? new Date(settings.dispatchedOrdersFrom).toISOString().slice(0, 10)
       : "",
@@ -127,6 +155,8 @@ function readForm(formData, current) {
     importDispatchedOrders: formData.has("importDispatchedOrders"),
     dispatchCarrier: text("dispatchCarrier") || null,
     koganOrderLocation: text("koganOrderLocation") || null,
+    koganFirstDiscount: text("koganFirstDiscount") || null,
+    koganOrderMethod: text("koganOrderMethod") || orderMethodOf(current),
     dispatchedOrdersFrom: parseDate(text("dispatchedOrdersFrom")),
   };
 }
@@ -157,6 +187,20 @@ function validate(values) {
   }
   if (values.dispatchCarrier && values.dispatchCarrier.length > 100) {
     errors.dispatchCarrier = "Enter at most 100 characters.";
+  }
+  if (values.koganFirstDiscount !== null) {
+    const percent = Number(values.koganFirstDiscount);
+    if (
+      !Number.isFinite(percent) ||
+      percent < KOGAN_FIRST_MIN_PERCENT ||
+      percent > KOGAN_FIRST_MAX_PERCENT ||
+      Math.round(percent * 100) !== percent * 100
+    ) {
+      errors.koganFirstDiscount = `Enter a percentage between ${KOGAN_FIRST_MIN_PERCENT} and ${KOGAN_FIRST_MAX_PERCENT} (up to 2 decimals), or leave it empty.`;
+    }
+  }
+  if (!ORDER_METHODS.includes(values.koganOrderMethod)) {
+    errors.koganOrderMethod = "Choose how Kogan orders are created.";
   }
   if (values.defaultCategory && values.defaultCategory.length > 255) {
     errors.defaultCategory = "The category is too long.";
@@ -202,14 +246,11 @@ export const action = async ({ request }) => {
   }
 
   if (formData.get("intent") === "kogan-first") {
-    const job = await startKoganFirstJob(session.shop);
-    const started = job.type === "koganfirst";
+    const started = await sendKoganFirst(session.shop);
     return {
       intent: "kogan-first",
       ok: started,
-      message: started
-        ? "Removing SKU-level Kogan FIRST prices and resyncing all listings. Progress is shown on the Dashboard"
-        : "Another job is running. Try again once it finishes",
+      message: koganFirstMessage(started, koganFirstPercent(current)),
     };
   }
 
@@ -236,6 +277,12 @@ export const action = async ({ request }) => {
     return { intent: "save", ok: false, errors, message: "Please fix the highlighted fields" };
   }
 
+  // Saved as a normalised percentage ("5", "7.5"), or null when empty.
+  values.koganFirstDiscount = koganFirstPercent(values);
+  const koganFirstChanged = values.koganFirstDiscount !== koganFirstPercent(current);
+  const koganFirstNote = koganFirstChanged
+    ? `. The new Kogan FIRST discount is used for every product from now on; click "Send Kogan FIRST prices to Kogan now" once the running job finishes to update all listings at once`
+    : "";
   const shippingChanged = values.koganShipping !== current.koganShipping;
   const environmentChanged = apiHost(values.apiBaseUrl) !== apiHost(current.apiBaseUrl);
   const locationChanged = Boolean(values.productLocation) && values.productLocation !== current.productLocation;
@@ -263,7 +310,7 @@ export const action = async ({ request }) => {
     return {
       intent: "save",
       ok: true,
-      message: `Settings saved. Kogan environment changed: checking ${count} SKUs and listing missing ones again${note}`,
+      message: `Settings saved. Kogan environment changed: checking ${count} SKUs and listing missing ones again${note}${koganFirstNote}`,
     };
   }
 
@@ -273,7 +320,7 @@ export const action = async ({ request }) => {
     return {
       intent: "save",
       ok: true,
-      message: `Settings saved. Sending stock location ${values.productLocation} to Kogan for all products`,
+      message: `Settings saved. Sending stock location ${values.productLocation} to Kogan for all products${koganFirstNote}`,
     };
   }
 
@@ -283,7 +330,17 @@ export const action = async ({ request }) => {
     return {
       intent: "save",
       ok: true,
-      message: shippingMessage(started, values.koganShipping, "Settings saved. "),
+      message: `${shippingMessage(started, values.koganShipping, "Settings saved. ")}${koganFirstNote}`,
+    };
+  }
+
+  // A new Kogan FIRST discount is applied to every listing already on Kogan.
+  if (koganFirstChanged) {
+    const started = await sendKoganFirst(session.shop);
+    return {
+      intent: "save",
+      ok: true,
+      message: koganFirstMessage(started, values.koganFirstDiscount, "Settings saved. "),
     };
   }
 
@@ -384,12 +441,6 @@ export default function Settings() {
                 >
                   Check brands and titles on Kogan
                 </s-button>
-                <s-button
-                  loading={busyIntent === "kogan-first" || undefined}
-                  onClick={() => submit("kogan-first")}
-                >
-                  Remove Kogan FIRST prices and resync
-                </s-button>
               </s-stack>
               <s-text color="subdued">
                 Kogan keeps its test and live environments separate. After switching the API
@@ -397,10 +448,7 @@ export default function Settings() {
                 not have yet are created there automatically. “Check brands and titles on
                 Kogan” reads every Kogan listing, sends the Shopify brand (Vendor) and title
                 again wherever Kogan shows something different, and lists Kogan listings that
-                are not linked to a Shopify product in Activity. “Remove Kogan FIRST prices and
-                resync” removes Kogan FIRST (Mighty Ape Primate) prices set on single SKUs, so
-                the store-wide Kogan FIRST discount that Kogan sets for your store applies, and
-                sends every listing to Kogan again. The app never sets Kogan FIRST prices itself.
+                are not linked to a Shopify product in Activity.
               </s-text>
             </s-stack>
           </s-section>
@@ -515,6 +563,40 @@ export default function Settings() {
             </s-stack>
           </s-section>
 
+          <s-section heading="Kogan FIRST price (Mighty Ape Primate)">
+            <s-stack gap="base">
+              <s-number-field
+                name="koganFirstDiscount"
+                label="Kogan FIRST discount"
+                suffix="%"
+                value={settings.koganFirstDiscount}
+                min={settings.koganFirstLimits.min}
+                max={settings.koganFirstLimits.max}
+                step={0.01}
+                placeholder="Not managed by the app"
+                details="Kogan FIRST members (Primate on Mighty Ape) pay this much less than the normal price. Sent to Kogan for every product and kept up to date when prices change. Leave empty to let Kogan's own store-wide discount apply."
+                error={errors.koganFirstDiscount}
+              />
+              <s-banner tone="info" heading="How Kogan applies it">
+                Each Kogan listing gets a Kogan FIRST price of its normal price minus this
+                percentage, for example 5% of $499.00 gives $474.05. Kogan requires at least $2 or
+                3% off (whichever is greater), so cheaper items get $2 off. If Kogan also has a
+                store-wide Kogan FIRST discount for your store, Kogan shows the larger of the two;
+                ask Kogan to set the store-wide discount to 0% so this setting has full control.
+                Saving a different value updates all listings already on Kogan. Leaving it empty
+                and clicking the button below removes the Kogan FIRST prices set on single SKUs.
+              </s-banner>
+              <s-stack direction="inline">
+                <s-button
+                  loading={busyIntent === "kogan-first" || undefined}
+                  onClick={() => submit("kogan-first")}
+                >
+                  Send Kogan FIRST prices to Kogan now
+                </s-button>
+              </s-stack>
+            </s-stack>
+          </s-section>
+
           <s-section heading="Default Kogan category">
             <s-stack gap="base">
               <s-paragraph>
@@ -603,6 +685,26 @@ export default function Settings() {
                 step={1}
                 error={errors.orderSyncMinutes}
               />
+              <s-select
+                name="koganOrderMethod"
+                label="Create Kogan orders in Shopify as"
+                details="Applies to new Kogan orders. Shipping apps such as eShip only import orders that Shopify marks as needing shipping."
+                error={errors.koganOrderMethod}
+              >
+                <s-option value="draft" selected={settings.koganOrderMethod === "draft" || undefined}>
+                  Draft order, completed as paid (recommended: Shopify shows “Shipping”)
+                </s-option>
+                <s-option value="direct" selected={settings.koganOrderMethod === "direct" || undefined}>
+                  Direct order (older method: Shopify shows “Shipping not required”)
+                </s-option>
+              </s-select>
+              {settings.koganOrderMethod === "draft" && !settings.draftOrdersAllowed && (
+                <s-banner tone="warning" heading="Permission needed for draft orders">
+                  The app needs the “Draft orders” permission to create Kogan orders this way.
+                  Until it is approved, Kogan orders are still created as direct orders. Open the
+                  app from Shopify Admin → Apps and approve the updated permissions when asked.
+                </s-banner>
+              )}
               <s-select
                 name="koganOrderLocation"
                 label="Ship Kogan orders from"

@@ -30,6 +30,8 @@ import {
   getRetiredSkus,
   getSettings,
   hasSyncTag,
+  koganFirstPercent,
+  koganFirstPrice,
   koganShippingValue,
   logSync,
   shippingModeOf,
@@ -51,7 +53,7 @@ const CONTENT_FIELDS = [
   "variantGroup",
   "location",
 ];
-const OFFER_FIELDS = ["price", "rrp", "stock", "enabled", "shipping"];
+const OFFER_FIELDS = ["price", "rrp", "stock", "enabled", "shipping", "koganFirst"];
 
 const activeJobs = new Set();
 const pushTimers = new Map();
@@ -1080,6 +1082,13 @@ async function runPush(admin, shop, productId, { reason = "webhook", product: gi
   const shipping = koganShippingValue(settings);
   for (const snapshot of snapshots) snapshot.fields.shipping = shipping;
 
+  // The Kogan FIRST discount from Settings, when the app manages it. The
+  // Kogan FIRST price itself is worked out from the price when it is sent.
+  const koganFirst = koganFirstPercent(settings);
+  if (koganFirst) {
+    for (const snapshot of snapshots) snapshot.fields.koganFirst = koganFirst;
+  }
+
   const links = await prisma.koganProductLink.findMany({
     where: { shop, koganSku: { in: snapshots.map((item) => item.sku) } },
   });
@@ -1185,6 +1194,11 @@ function buildOfferData(link, fields) {
     offer.shipping = fields.shipping;
   } else if (link.shipping !== null && link.shipping !== undefined) {
     offer.shipping = link.shipping;
+  }
+  // koganFirst is the discount percentage from Settings; null clears the
+  // Kogan FIRST price on Kogan; absent means the app leaves it as it is.
+  if (fields.koganFirst !== undefined) {
+    offer.kogan_first_price = fields.koganFirst === null ? null : koganFirstPrice(fields.price, fields.koganFirst);
   }
   return { [link.currency]: offer };
 }
@@ -1325,7 +1339,7 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
 
   // Products that were linked before variant groups existed still need their
   // group sent once.
-  for (const field of ["variantGroup", "location", "shipping"]) {
+  for (const field of ["variantGroup", "location", "shipping", "koganFirst"]) {
     if (previous && !(field in previous) && next[field] && !changed.includes(field)) {
       changed.push(field);
     }
@@ -1420,7 +1434,7 @@ async function pushChanges(kogan, shop, product, snapshot, link, reason) {
     if (stock !== null && (offerChanges.includes("stock") || offerChanges.includes("enabled"))) {
       payload.stock = stock;
     }
-    if (["price", "rrp", "shipping"].some((field) => offerChanges.includes(field)) && next.price) {
+    if (["price", "rrp", "shipping", "koganFirst"].some((field) => offerChanges.includes(field)) && next.price) {
       payload.offer_data = buildOfferData(link, next);
     }
 
@@ -1699,6 +1713,10 @@ async function createOnKogan(kogan, shop, settings, product, snapshot) {
   const offer = { price: fields.price, handling_days: settings.handlingDays };
   if (fields.rrp && Number(fields.rrp) > Number(fields.price)) offer.rrp = fields.rrp;
   if (fields.shipping !== null && fields.shipping !== undefined) offer.shipping = fields.shipping;
+  if (fields.koganFirst) {
+    const firstPrice = koganFirstPrice(fields.price, fields.koganFirst);
+    if (firstPrice) offer.kogan_first_price = firstPrice;
+  }
 
   const payload = {
     product_sku: snapshot.sku,
@@ -2483,18 +2501,22 @@ export function startCatalogueCheckJob(shop) {
 const OFFER_RESYNC_BATCH_SIZE = 200;
 
 /**
- * Removes Kogan FIRST prices set on individual SKUs and sends every listing's
- * offer to Kogan again. Kogan applies a store-wide Kogan FIRST (Mighty Ape
- * Primate) discount, but a price set on a single SKU takes priority over it.
- * Linked products are sent with their Shopify price; listings that are not
- * linked keep the offer Kogan has. Only the Kogan FIRST price is cleared.
+ * Sends the Kogan FIRST (Mighty Ape Primate) discount from Settings to every
+ * listing on Kogan, together with the rest of its offer. With a discount set,
+ * each listing gets a Kogan FIRST price of its normal price minus that
+ * percentage (at least $2 or 3% off, Kogan's minimum). With no discount set,
+ * Kogan FIRST prices set on individual SKUs are removed, so only the
+ * store-wide discount Kogan applies is used. Linked products are sent with
+ * their Shopify price; listings that are not linked keep the offer Kogan has.
  */
 export function startKoganFirstJob(shop) {
   return startJob(shop, "koganfirst", async (counters, progress) => {
     const settings = await getSettings(shop);
     const kogan = createKoganClient(settings);
     const shipping = koganShippingValue(settings);
+    const percent = koganFirstPercent(settings);
     const cleared = [];
+    const examples = [];
     let pendingUrls = [];
     let taskIds = [];
 
@@ -2504,6 +2526,7 @@ export function startKoganFirstJob(shop) {
       const links = await prisma.koganProductLink.findMany({ where: { shop, koganSku: { in: skus } } });
       const linkBySku = new Map(links.map((link) => [link.koganSku, link]));
       const updates = [];
+      const linkedUpdates = new Map();
 
       for (const koganProduct of page) {
         counters.processed += 1;
@@ -2514,7 +2537,7 @@ export function startKoganFirstJob(shop) {
           continue;
         }
 
-        if (offer.kogan_first_price !== null && offer.kogan_first_price !== undefined && offer.kogan_first_price !== "") {
+        if (!percent && offer.kogan_first_price !== null && offer.kogan_first_price !== undefined && offer.kogan_first_price !== "") {
           cleared.push(`${sku} (${toMoneyString(offer.kogan_first_price)})`);
         }
 
@@ -2528,7 +2551,15 @@ export function startKoganFirstJob(shop) {
 
         let offerData;
         if (link && typeof fields?.price === "string" && Number(fields.price) > 0) {
-          offerData = buildOfferData(link, { ...fields, shipping: typeof fields.shipping === "object" ? shipping : fields.shipping ?? shipping });
+          offerData = buildOfferData(link, {
+            ...fields,
+            shipping: typeof fields.shipping === "object" ? shipping : fields.shipping ?? shipping,
+            koganFirst: percent,
+          });
+          const nextFields = { ...fields };
+          if (percent) nextFields.koganFirst = percent;
+          else delete nextFields.koganFirst;
+          linkedUpdates.set(sku, { link, snapshot: JSON.stringify(nextFields) });
         } else {
           const kept = {
             price: toMoneyString(offer.price),
@@ -2536,9 +2567,14 @@ export function startKoganFirstJob(shop) {
           };
           if (offer.rrp) kept.rrp = toMoneyString(offer.rrp);
           if (offer.shipping !== undefined) kept.shipping = offer.shipping === null ? null : toMoneyString(offer.shipping);
+          kept.kogan_first_price = percent ? koganFirstPrice(kept.price, percent) : null;
           offerData = { [settings.currency]: kept };
         }
-        offerData[settings.currency].kogan_first_price = null;
+
+        const sent = offerData[settings.currency];
+        if (percent && sent.kogan_first_price && examples.length < 3) {
+          examples.push(`${sku} ${sent.price} → ${sent.kogan_first_price}`);
+        }
         updates.push({ product_sku: sku, offer_data: offerData });
       }
 
@@ -2564,6 +2600,18 @@ export function startKoganFirstJob(shop) {
           }
           counters.failed += failedSkus.size;
           counters.updated += batch.length - failedSkus.size;
+
+          // Remember what was sent, so later syncs keep the same discount
+          // without sending it again. A link that changed meanwhile is left
+          // alone; its own sync sends the discount with it.
+          for (const update of batch) {
+            const linked = linkedUpdates.get(update.product_sku);
+            if (!linked || failedSkus.has(update.product_sku)) continue;
+            await prisma.koganProductLink.updateMany({
+              where: { id: linked.link.id, snapshot: linked.link.snapshot },
+              data: { snapshot: linked.snapshot },
+            });
+          }
         } catch (error) {
           counters.failed += batch.length;
           await logSync(shop, {
@@ -2578,9 +2626,14 @@ export function startKoganFirstJob(shop) {
       await progress(true);
     }
 
-    const summary = cleared.length
-      ? `${cleared.length} listings had their own Kogan FIRST price, which was removed so the store-wide Kogan FIRST discount applies: ${cleared.join(", ")}. All ${counters.updated} listings were sent to Kogan again.`
-      : `No listing had its own Kogan FIRST price, so the store-wide Kogan FIRST discount set by Kogan applies to all of them. All ${counters.updated} listings were sent to Kogan again to refresh them.`;
+    let summary;
+    if (percent) {
+      summary = `Kogan FIRST price set to ${percent}% off the normal price on ${counters.updated} listings${examples.length ? ` (for example ${examples.join(", ")})` : ""}. Where ${percent}% is less than $2, $2 is taken off instead, as Kogan requires. If Kogan also has a store-wide Kogan FIRST discount for your store, Kogan shows the larger of the two.`;
+    } else if (cleared.length) {
+      summary = `${cleared.length} listings had their own Kogan FIRST price, which was removed so the store-wide Kogan FIRST discount applies: ${cleared.join(", ")}. All ${counters.updated} listings were sent to Kogan again.`;
+    } else {
+      summary = `No listing had its own Kogan FIRST price, so the store-wide Kogan FIRST discount set by Kogan applies to all of them. All ${counters.updated} listings were sent to Kogan again to refresh them.`;
+    }
     await logSync(shop, {
       direction: "shopify_to_kogan",
       action: "update",
@@ -2589,6 +2642,7 @@ export function startKoganFirstJob(shop) {
       taskId: taskIds.slice(0, 5).join(", ") || null,
     });
 
+    if (percent) return `Kogan FIRST price set to ${percent}% off on ${counters.updated} listings.`;
     return cleared.length
       ? `Removed the Kogan FIRST price from ${cleared.length} listings and resynced ${counters.updated}.`
       : `No SKU-level Kogan FIRST prices found. Resynced ${counters.updated} listings.`;

@@ -4,6 +4,7 @@ import { createKoganClient } from "./kogan-client.server";
 import { findVariantsBySkus } from "./shopify-products.server";
 import {
   canWriteCustomers,
+  canWriteDraftOrders,
   cancelShopifyOrder,
   createOrderFromKogan,
   fulfillOrderItems,
@@ -12,7 +13,7 @@ import {
   moveOrderToLocation,
   setOrderCustomer,
 } from "./shopify-orders.server";
-import { getSettings, hasKoganCredentials, logSync, saveSettings } from "./store.server";
+import { getSettings, hasKoganCredentials, logSync, orderMethodOf, saveSettings } from "./store.server";
 import { applyDefaultShipping, checkPendingKoganTasks, verifyKoganState } from "./sync.server";
 import { ensureCategories } from "./categories.server";
 
@@ -52,6 +53,9 @@ function customerName(order) {
 
 const CUSTOMER_PERMISSION_NOTE =
   'The order has no customer because the app does not have the "write customers" permission yet. Approve the updated app permissions in Shopify, and the customer is added automatically.';
+
+const DRAFT_PERMISSION_NOTE =
+  'It was created as a direct order (Shopify shows "Shipping not required") because the app does not have the "draft orders" permission yet. Approve the updated app permissions in Shopify so new Kogan orders are created as draft orders that shipping apps such as eShip import.';
 
 // Carriers recognised from the tracking link when Shopify has no carrier name.
 const CARRIERS_BY_HOST = [
@@ -146,11 +150,14 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
   try {
     const variantsBySku = await resolveVariants(admin, shop, items.map((item) => item.sku));
     const withCustomer = await canWriteCustomers(admin, shop);
+    const wantsDraft = orderMethodOf(settings) === "draft";
+    const asDraft = wantsDraft && (await canWriteDraftOrders(admin, shop));
     const created = await createOrderFromKogan(admin, {
       order,
       variantsBySku,
       tags: [settings.syncTag, "Kogan order"],
       withCustomer,
+      asDraft,
     });
 
     const unmatched = items.filter((item) => !variantsBySku.has(item.sku)).map((item) => item.sku);
@@ -173,6 +180,12 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
       notes.push(`No Shopify product found for SKU ${unmatched.join(", ")}, so those lines were added as custom items.`);
     }
     if (!withCustomer && rowData.customerName) notes.push(CUSTOMER_PERMISSION_NOTE);
+    if (wantsDraft && !asDraft) notes.push(DRAFT_PERMISSION_NOTE);
+    if (created.draftProblem) {
+      notes.push(
+        `It was created as a direct order because a draft order could not be used (${created.draftProblem}), so Shopify shows "Shipping not required" and shipping apps such as eShip may not import it.`,
+      );
+    }
     if (created.customerProblem) {
       notes.push(`The customer could not be added yet (${created.customerProblem}); the app tries once more automatically.`);
     }

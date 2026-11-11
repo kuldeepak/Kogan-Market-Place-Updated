@@ -100,15 +100,14 @@ const scopeCache = new Map();
 const SCOPE_CACHE_MS = 10 * 60 * 1000;
 
 /**
- * Whether the app may create customers in this store (the write_customers
- * permission). Checked first, so an order is never sent with a customer that
- * Shopify would refuse. Cached for a few minutes per store.
+ * The access scopes the merchant has approved for the app, cached for a few
+ * minutes per store. An empty set when they cannot be read.
  */
-export async function canWriteCustomers(admin, shop) {
+async function grantedScopes(admin, shop) {
   const cached = scopeCache.get(shop);
-  if (cached && Date.now() - cached.at < SCOPE_CACHE_MS) return cached.allowed;
+  if (cached && Date.now() - cached.at < SCOPE_CACHE_MS) return cached.scopes;
 
-  let allowed = false;
+  let scopes = new Set();
   try {
     const data = await shopifyGraphql(
       admin,
@@ -122,13 +121,27 @@ export async function canWriteCustomers(admin, shop) {
         }
       `,
     );
-    allowed = (data.currentAppInstallation?.accessScopes || []).some((scope) => scope.handle === "write_customers");
+    scopes = new Set((data.currentAppInstallation?.accessScopes || []).map((scope) => scope.handle));
   } catch {
-    allowed = false;
+    scopes = new Set();
   }
 
-  scopeCache.set(shop, { allowed, at: Date.now() });
-  return allowed;
+  scopeCache.set(shop, { scopes, at: Date.now() });
+  return scopes;
+}
+
+/**
+ * Whether the app may create customers in this store (the write_customers
+ * permission). Checked first, so an order is never sent with a customer that
+ * Shopify would refuse.
+ */
+export async function canWriteCustomers(admin, shop) {
+  return (await grantedScopes(admin, shop)).has("write_customers");
+}
+
+/** Whether the app may create draft orders (the write_draft_orders permission). */
+export async function canWriteDraftOrders(admin, shop) {
+  return (await grantedScopes(admin, shop)).has("write_draft_orders");
 }
 
 function isCustomerProblem(text) {
@@ -150,12 +163,251 @@ function withoutPhones(input) {
   };
 }
 
+function moneyInput(amount, currencyCode) {
+  return { amount: Number(amount || 0).toFixed(2), currencyCode };
+}
+
+function userErrorText(errors) {
+  return errors.map((error) => `${(error.field || []).join(".")} ${error.message}`.trim()).join("; ");
+}
+
+async function deleteDraftOrder(admin, id) {
+  try {
+    await shopifyGraphql(
+      admin,
+      `#graphql
+        mutation KoganDraftOrderDelete($input: DraftOrderDeleteInput!) {
+          draftOrderDelete(input: $input) {
+            deletedId
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `,
+      { input: { id } },
+    );
+  } catch {
+    // An unused draft order left behind does nothing; Shopify removes open
+    // drafts that are never completed after a while.
+  }
+}
+
+async function readDraftOrder(admin, id) {
+  const data = await shopifyGraphql(
+    admin,
+    `#graphql
+      query KoganDraftOrder($id: ID!) {
+        draftOrder(id: $id) {
+          id
+          status
+          totalPriceSet {
+            presentmentMoney {
+              amount
+            }
+          }
+          order {
+            id
+            name
+            customer {
+              id
+            }
+          }
+        }
+      }
+    `,
+    { id },
+  );
+  return data.draftOrder;
+}
+
+/**
+ * Creates the Shopify order through a draft order that is completed as paid.
+ * Shopify treats an order made this way like one placed at checkout: its
+ * items are marked for shipping ("Shipping" delivery method), so shipping
+ * apps such as eShip import it. Orders made with orderCreate get no delivery
+ * method ("Shipping not required"), and Shopify does not allow changing that
+ * afterwards.
+ *
+ * Throws when the order could not be made this way and nothing was created,
+ * so the caller can use orderCreate instead. An error with orderMayExist set
+ * means the result is unknown and no other attempt must be made.
+ */
+async function createThroughDraftOrder(admin, { order, variantsBySku, input, customerId }) {
+  const currency = order.Currency;
+
+  const lineItems = order.Items.map((item) => {
+    const variant = variantsBySku.get(item.SellerSku);
+    if (variant) {
+      return {
+        variantId: variant.variantId,
+        quantity: item.Quantity,
+        priceOverride: moneyInput(item.UnitPrice, currency),
+      };
+    }
+    return {
+      title: `Kogan item ${item.SellerSku}`,
+      sku: item.SellerSku,
+      quantity: item.Quantity,
+      originalUnitPriceWithCurrency: moneyInput(item.UnitPrice, currency),
+      requiresShipping: true,
+      taxable: true,
+    };
+  });
+
+  let draftInput = {
+    lineItems,
+    presentmentCurrencyCode: currency,
+    acceptAutomaticDiscounts: false,
+    shippingAddress: input.shippingAddress,
+    billingAddress: input.billingAddress,
+    shippingLine: {
+      title: input.shippingLines[0].title,
+      priceWithCurrency: moneyInput(order.TotalShippingPrice, currency),
+    },
+    tags: input.tags,
+    note: input.note,
+    customAttributes: input.customAttributes,
+    ...(customerId ? { purchasingEntity: { customerId } } : {}),
+  };
+
+  const createDraft = async (draft) => {
+    const data = await shopifyGraphql(
+      admin,
+      `#graphql
+        mutation KoganDraftOrderCreate($input: DraftOrderInput!) {
+          draftOrderCreate(input: $input) {
+            draftOrder {
+              id
+              status
+              totalPriceSet {
+                presentmentMoney {
+                  amount
+                }
+              }
+              order {
+                id
+                name
+                customer {
+                  id
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `,
+      { input: draft },
+    );
+    return data.draftOrderCreate;
+  };
+
+  let result = await createDraft(draftInput);
+  let errors = result.userErrors;
+
+  // A rejected customer is added to the order afterwards instead.
+  if (draftInput.purchasingEntity && errors.some((error) => isCustomerProblem(`${(error.field || []).join(".")} ${error.message}`))) {
+    draftInput = { ...draftInput };
+    delete draftInput.purchasingEntity;
+    result = await createDraft(draftInput);
+    errors = result.userErrors;
+  }
+
+  // Kogan phone numbers are free text; retry without them if Shopify rejects one.
+  if (errors.some((error) => /phone/i.test(`${error.field} ${error.message}`))) {
+    draftInput = withoutPhones(draftInput);
+    result = await createDraft(draftInput);
+    errors = result.userErrors;
+  }
+
+  if (errors.length > 0 || !result.draftOrder) {
+    if (result.draftOrder?.id) await deleteDraftOrder(admin, result.draftOrder.id);
+    throw new Error(`Shopify could not create the draft order: ${userErrorText(errors)}`);
+  }
+
+  const draft = result.draftOrder;
+
+  // The order must total exactly what the buyer paid on Kogan.
+  const draftTotal = Number(draft.totalPriceSet?.presentmentMoney?.amount);
+  const koganTotal = Number(order.TotalPrice || 0);
+  if (!Number.isFinite(draftTotal) || Math.abs(draftTotal - koganTotal) > 0.005) {
+    await deleteDraftOrder(admin, draft.id);
+    throw new Error(
+      `the draft order total (${Number.isFinite(draftTotal) ? draftTotal.toFixed(2) : "unknown"}) did not match the Kogan total (${koganTotal.toFixed(2)})`,
+    );
+  }
+
+  let completed;
+  try {
+    const data = await shopifyGraphql(
+      admin,
+      `#graphql
+        mutation KoganDraftOrderComplete($id: ID!) {
+          draftOrderComplete(id: $id) {
+            draftOrder {
+              id
+              status
+              totalPriceSet {
+                presentmentMoney {
+                  amount
+                }
+              }
+              order {
+                id
+                name
+                customer {
+                  id
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `,
+      { id: draft.id },
+    );
+    completed = data.draftOrderComplete;
+  } catch (error) {
+    // The answer was lost: look at the draft to see whether it became an order.
+    let current = null;
+    try {
+      current = await readDraftOrder(admin, draft.id);
+    } catch {
+      const unknown = new Error(
+        `Shopify did not confirm whether draft order ${draft.id} was completed (${shortMessage(error)}). Check Shopify Orders before importing this Kogan order again.`,
+      );
+      unknown.orderMayExist = true;
+      throw unknown;
+    }
+    if (current?.order) return current.order;
+    await deleteDraftOrder(admin, draft.id);
+    throw error;
+  }
+
+  if (completed.draftOrder?.order) return completed.draftOrder.order;
+
+  await deleteDraftOrder(admin, draft.id);
+  throw new Error(`Shopify could not complete the draft order: ${userErrorText(completed.userErrors) || "no order was created"}`);
+}
+
 /**
  * Creates a Shopify order for a Kogan order. Kogan has already taken payment,
- * so the order is recorded as paid through a "Kogan" gateway, and stock is
- * deducted even if the product does not allow overselling.
+ * so the order is recorded as paid.
+ *
+ * With asDraft the order is made through a draft order (see
+ * createThroughDraftOrder), so Shopify marks it for shipping. When that is
+ * not possible the order is created directly, through a "Kogan" payment
+ * gateway with stock deducted even if the product does not allow
+ * overselling; draftProblem then says why.
  */
-export async function createOrderFromKogan(admin, { order, variantsBySku, tags, withCustomer = false }) {
+export async function createOrderFromKogan(admin, { order, variantsBySku, tags, withCustomer = false, asDraft = false }) {
   const currency = order.Currency;
 
   const lineItems = order.Items.map((item) => {
@@ -220,6 +472,17 @@ export async function createOrderFromKogan(admin, { order, variantsBySku, tags, 
       input.customer = { toAssociate: { id: customerId } };
     } catch (error) {
       customerProblem = shortMessage(error);
+    }
+  }
+
+  let draftProblem = null;
+  if (asDraft) {
+    try {
+      const created = await createThroughDraftOrder(admin, { order, variantsBySku, input, customerId });
+      return finishOrder(admin, created, customerId, customerProblem, { method: "draft", draftProblem });
+    } catch (error) {
+      if (error.orderMayExist) throw error;
+      draftProblem = shortMessage(error);
     }
   }
 
@@ -291,7 +554,15 @@ export async function createOrderFromKogan(admin, { order, variantsBySku, tags, 
     );
   }
 
-  const created = data.orderCreate.order;
+  return finishOrder(admin, data.orderCreate.order, customerId, customerProblem, { method: "direct", draftProblem });
+}
+
+/**
+ * Adds the customer created for the order when Shopify did not keep it, and
+ * returns the order with what happened.
+ */
+async function finishOrder(admin, created, customerId, problem, extra) {
+  let customerProblem = problem;
   let attached = created.customer?.id || null;
 
   // The order was created without the customer: add the customer that was
@@ -306,7 +577,7 @@ export async function createOrderFromKogan(admin, { order, variantsBySku, tags, 
     }
   }
 
-  return { ...created, customerId: attached, customerProblem };
+  return { ...created, customerId: attached, customerProblem, ...extra };
 }
 
 /**

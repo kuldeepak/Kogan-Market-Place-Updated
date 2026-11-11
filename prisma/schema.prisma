@@ -46,6 +46,8 @@ model KoganSettings {
   koganShipping        String?
   dispatchCarrier      String?
   koganOrderLocation   String?
+  koganFirstDiscount   String?
+  koganOrderMethod     String?
   autoSyncEnabled      Boolean  @default(true)
   createOnKogan        Boolean  @default(true)
   zeroStockOnDelete    Boolean  @default(true)
