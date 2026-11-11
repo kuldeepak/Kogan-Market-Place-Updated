@@ -9,6 +9,7 @@ import {
   fulfillOrderItems,
   getOrderFulfillments,
   getOrderState,
+  moveOrderToLocation,
   setOrderCustomer,
 } from "./shopify-orders.server";
 import { getSettings, hasKoganCredentials, logSync, saveSettings } from "./store.server";
@@ -509,6 +510,7 @@ export async function syncKoganOrders(shop) {
     summary.cancelled = await applyKoganCancellations(admin, shop, kogan);
     await retryFailedDispatches(admin, shop);
     await attachMissingCustomers(admin, shop);
+    await moveOrdersToLocation(admin, shop, settings);
 
     await saveSettings(shop, { lastOrderSyncAt: new Date(), lastOrderSyncError: null });
     return summary;
@@ -693,6 +695,55 @@ async function retryFailedDispatches(admin, shop) {
  * "failed" and not tried again; "" marks orders from an earlier version that
  * gave up too early, so they are tried once more.
  */
+const locationProblems = new Map();
+
+/**
+ * Moves open Kogan orders to the location chosen in Settings ("Ship Kogan
+ * orders from"), so the shipping app for that location imports them. Orders
+ * already there are left alone; a problem is logged once per order.
+ */
+async function moveOrdersToLocation(admin, shop, settings) {
+  if (!settings.koganOrderLocation) return;
+
+  const rows = await prisma.koganOrder.findMany({
+    where: {
+      shop,
+      shopifyOrderId: { not: null },
+      status: { in: ["imported", "partially_dispatched"] },
+      orderDate: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+    },
+    orderBy: { orderDate: "desc" },
+    take: RETRY_BATCH_SIZE,
+  });
+
+  for (const row of rows) {
+    const key = `${row.id}|${settings.koganOrderLocation}`;
+    try {
+      const moved = await moveOrderToLocation(admin, row.shopifyOrderId, settings.koganOrderLocation);
+      locationProblems.delete(key);
+      if (moved > 0) {
+        await logSync(shop, {
+          direction: "kogan_to_shopify",
+          action: "order",
+          status: "success",
+          title: `Kogan order ${row.orderLabel || row.koganOrderId}`,
+          message: `Shopify order ${row.shopifyName || ""} was assigned to the location chosen in Settings, so it ships from there.`,
+        });
+      }
+    } catch (error) {
+      if (locationProblems.get(key) === error.message) continue;
+      locationProblems.set(key, error.message);
+      await logSync(shop, {
+        direction: "kogan_to_shopify",
+        action: "order",
+        status: "error",
+        title: `Kogan order ${row.orderLabel || row.koganOrderId}`,
+        message: `Could not assign Shopify order ${row.shopifyName || ""} to the location chosen in Settings: ${error.message}`,
+      });
+    }
+  }
+}
+
 async function attachMissingCustomers(admin, shop) {
   const rows = await prisma.koganOrder.findMany({
     where: {

@@ -6,6 +6,7 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getSettings, hasKoganCredentials } from "../kogan/store.server";
 import { syncKoganOrders } from "../kogan/orders.server";
+import { compareOrderShipping } from "../kogan/shopify-orders.server";
 import {
   OrderStatusBadge,
   adminOrderUrl,
@@ -80,8 +81,37 @@ export const loader = async ({ request }) => {
   };
 };
 
+const COMPARE_ROWS = [
+  ["channel", "Sales channel"],
+  ["paymentStatus", "Payment status"],
+  ["fulfillmentStatus", "Fulfillment status"],
+  ["location", "Fulfillment location"],
+  ["deliveryMethod", "Delivery method"],
+  ["fulfillmentOrderStatus", "Fulfillment order status"],
+  ["shippingAddress", "Shipping address"],
+  ["shippingMethod", "Shipping method"],
+  ["requiresShipping", "Requires shipping"],
+  ["email", "Customer email"],
+  ["tags", "Tags"],
+];
+
 export const action = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const formData = await request.formData();
+
+  if (formData.get("intent") === "compare") {
+    const latest = await prisma.koganOrder.findFirst({
+      where: { shop: session.shop, shopifyOrderId: { not: null } },
+      orderBy: { orderDate: "desc" },
+    });
+    if (!latest) return { intent: "compare", ok: false, message: "There is no Kogan order in Shopify yet" };
+    try {
+      const comparison = await compareOrderShipping(admin, latest.shopifyOrderId);
+      return { intent: "compare", ok: true, comparison };
+    } catch (error) {
+      return { intent: "compare", ok: false, message: `Could not read the orders: ${error.message}` };
+    }
+  }
 
   try {
     const result = await syncKoganOrders(session.shop);
@@ -111,6 +141,8 @@ export default function Orders() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
+  const comparison = fetcher.data?.intent === "compare" ? fetcher.data.comparison : null;
+
   useEffect(() => {
     if (fetcher.state === "idle" && fetcher.data?.message) {
       shopify.toast.show(fetcher.data.message, { isError: !fetcher.data.ok });
@@ -134,10 +166,17 @@ export default function Orders() {
         variant="primary"
         icon="refresh"
         disabled={!data.configured || undefined}
-        loading={fetcher.state !== "idle" || undefined}
-        onClick={() => fetcher.submit({}, { method: "post" })}
+        loading={(fetcher.state !== "idle" && fetcher.formData?.get("intent") !== "compare") || undefined}
+        onClick={() => fetcher.submit({ intent: "sync" }, { method: "post" })}
       >
         Fetch orders now
+      </s-button>
+      <s-button
+        slot="secondary-actions"
+        loading={(fetcher.state !== "idle" && fetcher.formData?.get("intent") === "compare") || undefined}
+        onClick={() => fetcher.submit({ intent: "compare" }, { method: "post" })}
+      >
+        Check shipping app import
       </s-button>
 
       <s-stack gap="base">
@@ -153,6 +192,51 @@ export default function Orders() {
               : "Automatic order fetching is turned off in Settings."}{" "}
             Last checked: {formatRelative(data.lastOrderSyncAt).toLowerCase()}.
           </s-banner>
+        )}
+
+        {comparison && (
+          <s-section heading="Shipping app check (for example eShip)">
+            <s-stack gap="base">
+              <s-paragraph>
+                The newest Kogan order next to the newest order from another channel. A shipping
+                app that imports the other order but not the Kogan order filters on one of the
+                rows marked “Different” (most often the fulfillment location). Choose that
+                location in Settings → Orders → “Ship Kogan orders from”, or allow it in the
+                shipping app&apos;s Shopify import settings.
+              </s-paragraph>
+              <s-table>
+                <s-table-header-row>
+                  <s-table-header listSlot="primary">Detail</s-table-header>
+                  <s-table-header>Kogan order {comparison.kogan?.name || ""}</s-table-header>
+                  <s-table-header>Other order {comparison.other?.name || ""}</s-table-header>
+                  <s-table-header listSlot="secondary">Match</s-table-header>
+                </s-table-header-row>
+                <s-table-body>
+                  {COMPARE_ROWS.map(([key, label]) => {
+                    const kogan = comparison.kogan?.[key] ?? "—";
+                    const other = comparison.other?.[key] ?? "—";
+                    const same = key === "tags" || key === "channel" || kogan === other;
+                    return (
+                      <s-table-row key={key}>
+                        <s-table-cell>{label}</s-table-cell>
+                        <s-table-cell>{kogan}</s-table-cell>
+                        <s-table-cell>{other}</s-table-cell>
+                        <s-table-cell>
+                          {key === "tags" || key === "channel" ? (
+                            <s-text color="subdued">—</s-text>
+                          ) : same ? (
+                            <s-badge tone="success">Same</s-badge>
+                          ) : (
+                            <s-badge tone="critical">Different</s-badge>
+                          )}
+                        </s-table-cell>
+                      </s-table-row>
+                    );
+                  })}
+                </s-table-body>
+              </s-table>
+            </s-stack>
+          </s-section>
         )}
 
         <s-section padding="none">

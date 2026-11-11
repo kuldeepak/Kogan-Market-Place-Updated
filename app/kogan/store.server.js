@@ -20,6 +20,7 @@ const SETTINGS_DEFAULTS = {
   importDispatchedOrders: true,
   dispatchedOrdersFrom: null,
   dispatchCarrier: null,
+  koganOrderLocation: null,
 };
 
 export async function getSettings(shop) {

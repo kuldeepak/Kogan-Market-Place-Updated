@@ -142,7 +142,9 @@ export function JobBanner({ job }) {
           ? "Shipping update"
           : job.type === "catalogue"
             ? "Brand and title check"
-            : "Push to Kogan";
+            : job.type === "koganfirst"
+              ? "Kogan FIRST price resync"
+              : "Push to Kogan";
 
   if (job.status === "running") {
     // Kogan does not report a catalogue size, so imports show an open-ended

@@ -2480,6 +2480,121 @@ export function startCatalogueCheckJob(shop) {
   });
 }
 
+const OFFER_RESYNC_BATCH_SIZE = 200;
+
+/**
+ * Removes Kogan FIRST prices set on individual SKUs and sends every listing's
+ * offer to Kogan again. Kogan applies a store-wide Kogan FIRST (Mighty Ape
+ * Primate) discount, but a price set on a single SKU takes priority over it.
+ * Linked products are sent with their Shopify price; listings that are not
+ * linked keep the offer Kogan has. Only the Kogan FIRST price is cleared.
+ */
+export function startKoganFirstJob(shop) {
+  return startJob(shop, "koganfirst", async (counters, progress) => {
+    const settings = await getSettings(shop);
+    const kogan = createKoganClient(settings);
+    const shipping = koganShippingValue(settings);
+    const cleared = [];
+    let pendingUrls = [];
+    let taskIds = [];
+
+    for await (const page of kogan.listProducts({ pageSize: 100 })) {
+      counters.total += page.length;
+      const skus = page.map((item) => item.product_sku?.trim()).filter(Boolean);
+      const links = await prisma.koganProductLink.findMany({ where: { shop, koganSku: { in: skus } } });
+      const linkBySku = new Map(links.map((link) => [link.koganSku, link]));
+      const updates = [];
+
+      for (const koganProduct of page) {
+        counters.processed += 1;
+        const sku = koganProduct.product_sku?.trim();
+        const offer = koganProduct.offer_data?.[settings.currency];
+        if (!sku || !offer?.price) {
+          counters.skipped += 1;
+          continue;
+        }
+
+        if (offer.kogan_first_price !== null && offer.kogan_first_price !== undefined && offer.kogan_first_price !== "") {
+          cleared.push(`${sku} (${toMoneyString(offer.kogan_first_price)})`);
+        }
+
+        const link = linkBySku.get(sku);
+        let fields = null;
+        try {
+          fields = link?.snapshot ? JSON.parse(link.snapshot) : null;
+        } catch {
+          fields = null;
+        }
+
+        let offerData;
+        if (link && typeof fields?.price === "string" && Number(fields.price) > 0) {
+          offerData = buildOfferData(link, { ...fields, shipping: typeof fields.shipping === "object" ? shipping : fields.shipping ?? shipping });
+        } else {
+          const kept = {
+            price: toMoneyString(offer.price),
+            handling_days: offer.handling_days ?? settings.handlingDays,
+          };
+          if (offer.rrp) kept.rrp = toMoneyString(offer.rrp);
+          if (offer.shipping !== undefined) kept.shipping = offer.shipping === null ? null : toMoneyString(offer.shipping);
+          offerData = { [settings.currency]: kept };
+        }
+        offerData[settings.currency].kogan_first_price = null;
+        updates.push({ product_sku: sku, offer_data: offerData });
+      }
+
+      for (let index = 0; index < updates.length; index += OFFER_RESYNC_BATCH_SIZE) {
+        const batch = updates.slice(index, index + OFFER_RESYNC_BATCH_SIZE);
+        try {
+          const response = await kogan.updateStockAndPrice(batch);
+          pendingUrls = pendingUrls.concat(response.pendingUrls || []);
+          taskIds = taskIds.concat(response.taskIds || []);
+          const failedSkus = new Set();
+          for (const update of batch) {
+            const problems = collectProblems(response, update.product_sku);
+            if (problems.length === 0) continue;
+            failedSkus.add(update.product_sku);
+            await logSync(shop, {
+              direction: "shopify_to_kogan",
+              action: "update",
+              status: "error",
+              sku: update.product_sku,
+              message: `Could not resync the Kogan FIRST price: ${problems.join(" | ")}`,
+              taskId: (response.taskIds || []).join(", ") || null,
+            });
+          }
+          counters.failed += failedSkus.size;
+          counters.updated += batch.length - failedSkus.size;
+        } catch (error) {
+          counters.failed += batch.length;
+          await logSync(shop, {
+            direction: "shopify_to_kogan",
+            action: "update",
+            status: "error",
+            message: `Could not resync Kogan FIRST prices for ${batch.length} listings: ${error.message}`,
+          });
+        }
+      }
+
+      await progress(true);
+    }
+
+    const summary = cleared.length
+      ? `${cleared.length} listings had their own Kogan FIRST price, which was removed so the store-wide Kogan FIRST discount applies: ${cleared.join(", ")}. All ${counters.updated} listings were sent to Kogan again.`
+      : `No listing had its own Kogan FIRST price, so the store-wide Kogan FIRST discount set by Kogan applies to all of them. All ${counters.updated} listings were sent to Kogan again to refresh them.`;
+    await logSync(shop, {
+      direction: "shopify_to_kogan",
+      action: "update",
+      status: counters.failed > 0 ? "error" : "success",
+      message: `${summary}${counters.failed ? ` ${counters.failed} could not be sent (see the errors above).` : ""}`.slice(0, 2000),
+      taskId: taskIds.slice(0, 5).join(", ") || null,
+    });
+
+    return cleared.length
+      ? `Removed the Kogan FIRST price from ${cleared.length} listings and resynced ${counters.updated}.`
+      : `No SKU-level Kogan FIRST prices found. Resynced ${counters.updated} listings.`;
+  });
+}
+
 /**
  * Schedules every linked product to be checked against Kogan on the next
  * background run. Products Kogan does not have are listed again; the rest are

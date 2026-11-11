@@ -390,6 +390,169 @@ export async function getOrderFulfillments(admin, orderId) {
   });
 }
 
+/**
+ * Active Shopify locations, for choosing where Kogan orders ship from.
+ */
+export async function listLocations(admin) {
+  const data = await shopifyGraphql(
+    admin,
+    `#graphql
+      query KoganLocations {
+        locations(first: 50) {
+          nodes {
+            id
+            name
+            isActive
+          }
+        }
+      }
+    `,
+  );
+  return data.locations.nodes.filter((location) => location.isActive).map(({ id, name }) => ({ id, name }));
+}
+
+const MOVABLE_STATUSES = new Set(["OPEN", "SCHEDULED"]);
+
+/**
+ * Assigns the unfulfilled items of an order to a Shopify location, so the
+ * shipping app that handles that location (for example eShip) picks the
+ * order up. Returns how many fulfillment orders were moved; a problem
+ * Shopify reports is thrown.
+ */
+export async function moveOrderToLocation(admin, orderId, locationId) {
+  const data = await shopifyGraphql(
+    admin,
+    `#graphql
+      query KoganOrderLocations($id: ID!) {
+        order(id: $id) {
+          fulfillmentOrders(first: 20) {
+            nodes {
+              id
+              status
+              assignedLocation {
+                location {
+                  id
+                }
+              }
+            }
+          }
+        }
+      }
+    `,
+    { id: orderId },
+  );
+
+  let moved = 0;
+  for (const fulfillmentOrder of data.order?.fulfillmentOrders?.nodes || []) {
+    if (!MOVABLE_STATUSES.has(fulfillmentOrder.status)) continue;
+    if (fulfillmentOrder.assignedLocation?.location?.id === locationId) continue;
+
+    const result = await shopifyGraphql(
+      admin,
+      `#graphql
+        mutation KoganFulfillmentOrderMove($id: ID!, $newLocationId: ID!) {
+          fulfillmentOrderMove(id: $id, newLocationId: $newLocationId) {
+            movedFulfillmentOrder {
+              id
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `,
+      { id: fulfillmentOrder.id, newLocationId: locationId },
+    );
+    const errors = result.fulfillmentOrderMove.userErrors;
+    if (errors.length > 0) {
+      throw new Error(`Shopify could not move the order to the chosen location: ${errors.map((error) => error.message).join("; ")}`);
+    }
+    moved += 1;
+  }
+  return moved;
+}
+
+const SHIPPING_COMPARE_QUERY = `#graphql
+  fragment KoganShippingDetails on Order {
+    id
+    name
+    createdAt
+    sourceName
+    tags
+    email
+    requiresShipping
+    displayFinancialStatus
+    displayFulfillmentStatus
+    channelInformation {
+      displayName
+      app {
+        title
+      }
+    }
+    shippingAddress {
+      city
+      countryCodeV2
+    }
+    shippingLine {
+      title
+    }
+    fulfillmentOrders(first: 5) {
+      nodes {
+        status
+        assignedLocation {
+          name
+        }
+        deliveryMethod {
+          methodType
+        }
+      }
+    }
+  }
+
+  query KoganShippingCompare($id: ID!) {
+    kogan: order(id: $id) {
+      ...KoganShippingDetails
+    }
+    others: orders(first: 1, sortKey: CREATED_AT, reverse: true, query: "-tag:'Kogan order'") {
+      nodes {
+        ...KoganShippingDetails
+      }
+    }
+  }
+`;
+
+function describeShipping(order) {
+  if (!order) return null;
+  const fulfillmentOrders = order.fulfillmentOrders?.nodes || [];
+  const unique = (values) => [...new Set(values.filter(Boolean))].join(", ") || "—";
+  return {
+    name: order.name,
+    createdAt: order.createdAt,
+    channel: order.channelInformation?.displayName || order.channelInformation?.app?.title || order.sourceName || "—",
+    paymentStatus: order.displayFinancialStatus || "—",
+    fulfillmentStatus: order.displayFulfillmentStatus || "—",
+    location: unique(fulfillmentOrders.map((item) => item.assignedLocation?.name)),
+    deliveryMethod: unique(fulfillmentOrders.map((item) => item.deliveryMethod?.methodType)),
+    fulfillmentOrderStatus: unique(fulfillmentOrders.map((item) => item.status)),
+    shippingAddress: order.shippingAddress ? `${order.shippingAddress.city || ""} ${order.shippingAddress.countryCodeV2 || ""}`.trim() : "Missing",
+    shippingMethod: order.shippingLine?.title || "—",
+    requiresShipping: order.requiresShipping ? "Yes" : "No",
+    email: order.email ? "Yes" : "No",
+    tags: (order.tags || []).join(", ") || "—",
+  };
+}
+
+/**
+ * Shipping-related details of a Kogan order and of the newest order from
+ * another channel, side by side, to see why a shipping app such as eShip
+ * imports one and not the other.
+ */
+export async function compareOrderShipping(admin, koganOrderId) {
+  const data = await shopifyGraphql(admin, SHIPPING_COMPARE_QUERY, { id: koganOrderId });
+  return { kogan: describeShipping(data.kogan), other: describeShipping(data.others?.nodes?.[0]) };
+}
+
 export async function getOrderState(admin, orderId) {
   const data = await shopifyGraphql(
     admin,

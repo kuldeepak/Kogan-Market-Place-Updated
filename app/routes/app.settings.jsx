@@ -6,9 +6,11 @@ import { CategoryPicker } from "../components/category-picker";
 import { authenticate } from "../shopify.server";
 import { DEFAULT_API_BASE_URL, createKoganClient } from "../kogan/kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "../kogan/categories.server";
+import { listLocations } from "../kogan/shopify-orders.server";
 import {
   scheduleFullKoganCheck,
   startCatalogueCheckJob,
+  startKoganFirstJob,
   startLocationJob,
   startShippingJob,
 } from "../kogan/sync.server";
@@ -57,8 +59,9 @@ const STOCK_LOCATION_NAMES = {
 };
 
 export const loader = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const settings = await getSettings(session.shop);
+  const locations = await listLocations(admin).catch(() => []);
   const defaultCategoryRecord = settings.defaultCategory
     ? await resolveCategoryValue(categorySourceFor(settings).source, settings.defaultCategory).catch(() => null)
     : null;
@@ -85,6 +88,8 @@ export const loader = async ({ request }) => {
     orderSyncMinutes: settings.orderSyncMinutes,
     importDispatchedOrders: settings.importDispatchedOrders,
     dispatchCarrier: settings.dispatchCarrier || "",
+    koganOrderLocation: settings.koganOrderLocation || "",
+    locations,
     dispatchedOrdersFrom: settings.dispatchedOrdersFrom
       ? new Date(settings.dispatchedOrdersFrom).toISOString().slice(0, 10)
       : "",
@@ -121,6 +126,7 @@ function readForm(formData, current) {
     orderSyncMinutes: Number(text("orderSyncMinutes")),
     importDispatchedOrders: formData.has("importDispatchedOrders"),
     dispatchCarrier: text("dispatchCarrier") || null,
+    koganOrderLocation: text("koganOrderLocation") || null,
     dispatchedOrdersFrom: parseDate(text("dispatchedOrdersFrom")),
   };
 }
@@ -191,6 +197,18 @@ export const action = async ({ request }) => {
       ok: started,
       message: started
         ? "Checking brands and titles of all Kogan listings. Progress is shown on the Dashboard"
+        : "Another job is running. Try again once it finishes",
+    };
+  }
+
+  if (formData.get("intent") === "kogan-first") {
+    const job = await startKoganFirstJob(session.shop);
+    const started = job.type === "koganfirst";
+    return {
+      intent: "kogan-first",
+      ok: started,
+      message: started
+        ? "Removing SKU-level Kogan FIRST prices and resyncing all listings. Progress is shown on the Dashboard"
         : "Another job is running. Try again once it finishes",
     };
   }
@@ -366,6 +384,12 @@ export default function Settings() {
                 >
                   Check brands and titles on Kogan
                 </s-button>
+                <s-button
+                  loading={busyIntent === "kogan-first" || undefined}
+                  onClick={() => submit("kogan-first")}
+                >
+                  Remove Kogan FIRST prices and resync
+                </s-button>
               </s-stack>
               <s-text color="subdued">
                 Kogan keeps its test and live environments separate. After switching the API
@@ -373,7 +397,10 @@ export default function Settings() {
                 not have yet are created there automatically. “Check brands and titles on
                 Kogan” reads every Kogan listing, sends the Shopify brand (Vendor) and title
                 again wherever Kogan shows something different, and lists Kogan listings that
-                are not linked to a Shopify product in Activity.
+                are not linked to a Shopify product in Activity. “Remove Kogan FIRST prices and
+                resync” removes Kogan FIRST (Mighty Ape Primate) prices set on single SKUs, so
+                the store-wide Kogan FIRST discount that Kogan sets for your store applies, and
+                sends every listing to Kogan again. The app never sets Kogan FIRST prices itself.
               </s-text>
             </s-stack>
           </s-section>
@@ -576,6 +603,20 @@ export default function Settings() {
                 step={1}
                 error={errors.orderSyncMinutes}
               />
+              <s-select
+                name="koganOrderLocation"
+                label="Ship Kogan orders from"
+                details="The Shopify location new Kogan orders are assigned to. Choose the location your shipping app (for example eShip) imports orders from. Open Kogan orders are moved there on the next order check."
+              >
+                <s-option value="" selected={!settings.koganOrderLocation || undefined}>
+                  Let Shopify decide
+                </s-option>
+                {settings.locations.map((location) => (
+                  <s-option key={location.id} value={location.id} selected={settings.koganOrderLocation === location.id || undefined}>
+                    {location.name}
+                  </s-option>
+                ))}
+              </s-select>
               <s-text-field
                 name="dispatchCarrier"
                 label="Default carrier for Kogan dispatches"
