@@ -90,6 +90,7 @@ const COMPARE_ROWS = [
   ["fulfillmentOrderStatus", "Fulfillment order status"],
   ["shippingAddress", "Shipping address"],
   ["shippingMethod", "Shipping method"],
+  ["itemsPhysical", "Items are physical products"],
   ["requiresShipping", "Requires shipping"],
   ["email", "Customer email"],
   ["tags", "Tags"],

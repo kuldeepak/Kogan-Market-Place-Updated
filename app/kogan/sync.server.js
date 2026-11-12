@@ -1,5 +1,6 @@
 import prisma from "../db.server";
 import { backgroundAdmin } from "./shopify-admin.server";
+import { ensurePhysicalVariants } from "./shopify-orders.server";
 import { createKoganClient, storeCodeForCurrency } from "./kogan-client.server";
 import { categorySourceFor, resolveCategoryValue } from "./categories.server";
 import {
@@ -2646,6 +2647,51 @@ export function startKoganFirstJob(shop) {
     return cleared.length
       ? `Removed the Kogan FIRST price from ${cleared.length} listings and resynced ${counters.updated}.`
       : `No SKU-level Kogan FIRST prices found. Resynced ${counters.updated} listings.`;
+  });
+}
+
+/**
+ * Marks every Shopify variant linked to Kogan as a physical product
+ * ("This is a physical product"), so Kogan orders for them need shipping and
+ * shipping apps such as eShip import them. Variants that already are
+ * physical are not changed.
+ */
+export function startPhysicalJob(shop) {
+  return startJob(shop, "physical", async (counters, progress) => {
+    const admin = backgroundAdmin(shop);
+    const links = await prisma.koganProductLink.findMany({
+      where: { shop, shopifyVariantId: { startsWith: "gid://shopify/ProductVariant/" } },
+      select: { shopifyVariantId: true },
+    });
+    const variantIds = [...new Set(links.map((link) => link.shopifyVariantId))];
+    counters.total = variantIds.length;
+    const changed = [];
+    const problems = [];
+
+    for (let index = 0; index < variantIds.length; index += 100) {
+      const batch = variantIds.slice(index, index + 100);
+      const result = await ensurePhysicalVariants(admin, batch);
+      changed.push(...result.changed);
+      problems.push(...result.problems);
+      counters.processed += batch.length;
+      counters.updated += result.changed.length;
+      counters.failed += result.problems.length;
+      await progress(true);
+    }
+
+    const message = changed.length
+      ? `${changed.length} Kogan products were not marked as physical products in Shopify and now are, so their Kogan orders need shipping: ${changed.join(", ")}.`
+      : "All Kogan products are already marked as physical products in Shopify.";
+    await logSync(shop, {
+      direction: "kogan_to_shopify",
+      action: "update",
+      status: problems.length ? "error" : "success",
+      message: `${message}${problems.length ? ` Could not change: ${problems.join("; ")}` : ""}`.slice(0, 2000),
+    });
+
+    return changed.length
+      ? `Marked ${changed.length} Kogan products as physical products.`
+      : "All Kogan products are already physical products.";
   });
 }
 

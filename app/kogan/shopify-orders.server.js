@@ -753,6 +753,11 @@ const SHIPPING_COMPARE_QUERY = `#graphql
     tags
     email
     requiresShipping
+    lineItems(first: 20) {
+      nodes {
+        requiresShipping
+      }
+    }
     displayFinancialStatus
     displayFulfillmentStatus
     channelInformation {
@@ -793,6 +798,13 @@ const SHIPPING_COMPARE_QUERY = `#graphql
   }
 `;
 
+function physicalLabel(lines) {
+  if (lines.length === 0) return "—";
+  const physical = lines.filter((line) => line.requiresShipping).length;
+  if (physical === lines.length) return "Yes";
+  return physical === 0 ? "No" : `${physical} of ${lines.length}`;
+}
+
 function describeShipping(order) {
   if (!order) return null;
   const fulfillmentOrders = order.fulfillmentOrders?.nodes || [];
@@ -809,6 +821,7 @@ function describeShipping(order) {
     shippingAddress: order.shippingAddress ? `${order.shippingAddress.city || ""} ${order.shippingAddress.countryCodeV2 || ""}`.trim() : "Missing",
     shippingMethod: order.shippingLine?.title || "—",
     requiresShipping: order.requiresShipping ? "Yes" : "No",
+    itemsPhysical: physicalLabel(order.lineItems?.nodes || []),
     email: order.email ? "Yes" : "No",
     tags: (order.tags || []).join(", ") || "—",
   };
@@ -982,4 +995,80 @@ export async function fulfillOrderItems(admin, orderId, items, tracking = {}) {
   }
 
   return fulfillmentIds;
+}
+
+/**
+ * Marks the inventory items of these variants as physical products
+ * ("This is a physical product" in Shopify), when they are not. Shopify gives
+ * an order whose items are not physical the "Shipping not required" delivery
+ * method and drops its shipping line, and shipping apps such as eShip then
+ * skip it. Kogan orders are always shipped to the buyer, so the items must be
+ * physical. Returns the SKUs that were changed and any problems; a problem
+ * never stops the order.
+ */
+export async function ensurePhysicalVariants(admin, variantIds) {
+  const ids = [...new Set(variantIds.filter(Boolean))];
+  const changed = [];
+  const problems = [];
+  if (ids.length === 0) return { changed, problems };
+
+  let nodes = [];
+  try {
+    const data = await shopifyGraphql(
+      admin,
+      `#graphql
+        query KoganVariantShipping($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on ProductVariant {
+              id
+              sku
+              inventoryItem {
+                id
+                requiresShipping
+              }
+            }
+          }
+        }
+      `,
+      { ids },
+    );
+    nodes = (data.nodes || []).filter((node) => node?.inventoryItem);
+  } catch (error) {
+    problems.push(shortMessage(error));
+    return { changed, problems };
+  }
+
+  for (const variant of nodes) {
+    if (variant.inventoryItem.requiresShipping) continue;
+    try {
+      const data = await shopifyGraphql(
+        admin,
+        `#graphql
+          mutation KoganMarkPhysical($id: ID!, $input: InventoryItemInput!) {
+            inventoryItemUpdate(id: $id, input: $input) {
+              inventoryItem {
+                id
+                requiresShipping
+              }
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `,
+        { id: variant.inventoryItem.id, input: { requiresShipping: true } },
+      );
+      const errors = data.inventoryItemUpdate.userErrors;
+      if (errors.length > 0) {
+        problems.push(`${variant.sku || variant.id}: ${userErrorText(errors)}`);
+      } else {
+        changed.push(variant.sku || variant.id);
+      }
+    } catch (error) {
+      problems.push(`${variant.sku || variant.id}: ${shortMessage(error)}`);
+    }
+  }
+
+  return { changed, problems };
 }

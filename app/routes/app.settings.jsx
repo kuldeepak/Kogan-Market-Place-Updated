@@ -12,6 +12,7 @@ import {
   startCatalogueCheckJob,
   startKoganFirstJob,
   startLocationJob,
+  startPhysicalJob,
   startShippingJob,
 } from "../kogan/sync.server";
 
@@ -241,6 +242,18 @@ export const action = async ({ request }) => {
       ok: started,
       message: started
         ? "Checking brands and titles of all Kogan listings. Progress is shown on the Dashboard"
+        : "Another job is running. Try again once it finishes",
+    };
+  }
+
+  if (formData.get("intent") === "mark-physical") {
+    const job = await startPhysicalJob(session.shop);
+    const started = job.type === "physical";
+    return {
+      intent: "mark-physical",
+      ok: started,
+      message: started
+        ? "Checking that all Kogan products are physical products in Shopify. Progress is shown on the Dashboard"
         : "Another job is running. Try again once it finishes",
     };
   }
@@ -698,6 +711,20 @@ export default function Settings() {
                   Direct order (older method: Shopify shows “Shipping not required”)
                 </s-option>
               </s-select>
+              <s-paragraph>
+                Shopify shows “Shipping not required” for an order whose products are not marked
+                as physical products, and shipping apps such as eShip skip those orders. Before
+                creating a Kogan order, the app marks its products as physical (“This is a
+                physical product”) when needed. Use the button to check all Kogan products now.
+              </s-paragraph>
+              <s-stack direction="inline">
+                <s-button
+                  loading={busyIntent === "mark-physical" || undefined}
+                  onClick={() => submit("mark-physical")}
+                >
+                  Mark all Kogan products as physical
+                </s-button>
+              </s-stack>
               {settings.koganOrderMethod === "draft" && !settings.draftOrdersAllowed && (
                 <s-banner tone="warning" heading="Permission needed for draft orders">
                   The app needs the “Draft orders” permission to create Kogan orders this way.

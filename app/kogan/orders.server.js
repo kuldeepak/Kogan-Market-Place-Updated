@@ -7,6 +7,7 @@ import {
   canWriteDraftOrders,
   cancelShopifyOrder,
   createOrderFromKogan,
+  ensurePhysicalVariants,
   fulfillOrderItems,
   getOrderFulfillments,
   getOrderState,
@@ -149,6 +150,13 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
 
   try {
     const variantsBySku = await resolveVariants(admin, shop, items.map((item) => item.sku));
+    // Kogan orders are shipped to the buyer. Products not marked as physical
+    // in Shopify make the order "Shipping not required", which shipping
+    // apps such as eShip skip, so they are marked as physical first.
+    const physical = order.ShippingAddress
+      ? await ensurePhysicalVariants(admin, [...variantsBySku.values()].map((variant) => variant.variantId))
+      : { changed: [], problems: [] };
+
     const withCustomer = await canWriteCustomers(admin, shop);
     const wantsDraft = orderMethodOf(settings) === "draft";
     const asDraft = wantsDraft && (await canWriteDraftOrders(admin, shop));
@@ -181,6 +189,16 @@ async function importKoganOrder(admin, shop, settings, order, existingRow) {
     }
     if (!withCustomer && rowData.customerName) notes.push(CUSTOMER_PERMISSION_NOTE);
     if (wantsDraft && !asDraft) notes.push(DRAFT_PERMISSION_NOTE);
+    if (physical.changed.length) {
+      notes.push(
+        `SKU ${physical.changed.join(", ")} was not marked as a physical product in Shopify, so the app marked it ("This is a physical product") and the order needs shipping.`,
+      );
+    }
+    if (physical.problems.length) {
+      notes.push(
+        `Could not mark the product as physical (${physical.problems.join("; ")}). Tick "This is a physical product" on the variant in Shopify, otherwise the order shows "Shipping not required".`,
+      );
+    }
     if (created.draftProblem) {
       notes.push(
         `It was created as a direct order because a draft order could not be used (${created.draftProblem}), so Shopify shows "Shipping not required" and shipping apps such as eShip may not import it.`,
